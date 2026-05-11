@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChatSessionCreate(BaseModel):
@@ -8,6 +10,20 @@ class ChatSessionCreate(BaseModel):
 
 class ChatMessageCreate(BaseModel):
     content: str = Field(min_length=1)
+    context_type: Literal["general", "github_commit"] = "general"
+    repository_id: str | None = None
+    commit_sha: str | None = None
+    intent: Literal["auto", "explain", "compliance", "review"] = "auto"
+    persist_review: bool = True
+
+    @model_validator(mode="after")
+    def validate_context(self) -> "ChatMessageCreate":
+        if self.context_type == "github_commit":
+            if not self.repository_id:
+                raise ValueError("repository_id is required for github_commit context")
+            if not self.commit_sha:
+                raise ValueError("commit_sha is required for github_commit context")
+        return self
 
 
 class ChatMessageRead(BaseModel):
@@ -27,3 +43,4 @@ class ChatAnswer(BaseModel):
     rewritten_queries: list[str] = Field(default_factory=list)
     reasoning_summary: str = ""
     confidence: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)

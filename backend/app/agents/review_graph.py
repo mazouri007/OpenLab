@@ -20,6 +20,7 @@ from app.models import (
     KnowledgeChunk,
     PromptTemplate,
 )
+from app.services.commit_context.service import CommitContextService
 from app.services.llm.exceptions import LLMOutputParseError
 from app.services.llm.litellm_provider import LiteLLMProvider
 
@@ -69,6 +70,17 @@ def run_review_graph(
             content = raw_input.get("content") or ""
             return {"normalized_content": content, "source_files": []}
 
+        if source_type == "github_commit":
+            commit_context = CommitContextService(db).load_commit_context(
+                project_id=task.project_id,
+                repository_id=raw_input.get("repository_id") or "",
+                commit_sha=raw_input.get("commit_sha") or "",
+            )
+            return {
+                "normalized_content": commit_context.to_review_input(),
+                "source_files": [item.path for item in commit_context.files],
+            }
+
         repo = db.get(GithubRepository, raw_input.get("repository_id") or "")
         integration = (
             db.query(GithubIntegration)
@@ -81,7 +93,7 @@ def run_review_graph(
         if source_type == "github_pr":
             diff = github_client.fetch_pull_request_diff(repo.repo_full_name, raw_input.get("pr_number"))
         else:
-            diff = github_client.fetch_commit_diff(repo.repo_full_name, raw_input.get("commit_sha"))
+            diff = {"files": []}
         files = [item["path"] for item in diff["files"]]
         content = "\n\n".join(
             f"FILE: {item['path']}\nPATCH:\n{item.get('patch', '')}" for item in diff["files"]

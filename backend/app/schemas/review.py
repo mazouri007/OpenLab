@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ReviewRequest(BaseModel):
@@ -12,6 +12,22 @@ class ReviewRequest(BaseModel):
     pr_number: int | None = None
     commit_sha: str | None = None
     related_document_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_source_payload(self) -> "ReviewRequest":
+        if self.source_type == "github_commit":
+            if not self.repository_id:
+                raise ValueError("repository_id is required for github_commit reviews")
+            if not self.commit_sha:
+                raise ValueError("commit_sha is required for github_commit reviews")
+        elif self.source_type == "github_pr":
+            if not self.repository_id:
+                raise ValueError("repository_id is required for github_pr reviews")
+            if self.pr_number is None:
+                raise ValueError("pr_number is required for github_pr reviews")
+        elif self.source_type in {"snippet", "manual_diff", "file_upload"} and not self.content:
+            raise ValueError("content is required for snippet, manual_diff, and file_upload reviews")
+        return self
 
 
 class ReviewFinding(BaseModel):

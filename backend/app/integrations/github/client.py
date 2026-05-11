@@ -55,9 +55,31 @@ class GithubClient:
         commit = repo.get_commit(commit_sha)
         files = []
         for file in commit.files:
-            files.append({"path": file.filename, "patch": file.patch or "", "status": file.status})
+            files.append(
+                {
+                    "path": file.filename,
+                    "patch": file.patch or "",
+                    "status": file.status,
+                    "additions": file.additions,
+                    "deletions": file.deletions,
+                    "changes": file.changes,
+                }
+            )
         return {
             "repo_full_name": repo_full_name,
             "commit_sha": commit.sha,
+            "sha": commit.sha,
+            "message": commit.commit.message,
+            "author": {
+                "login": commit.author.login if commit.author else None,
+                "name": commit.commit.author.name if commit.commit.author else None,
+                "email": commit.commit.author.email if commit.commit.author else None,
+            },
+            "stats": {
+                "additions": commit.stats.additions,
+                "deletions": commit.stats.deletions,
+                "total": commit.stats.total,
+            },
+            "html_url": commit.html_url,
             "files": files,
         }

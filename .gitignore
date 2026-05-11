@@ -1,4 +1,7 @@
 .venv/
+.conda/
+.cache/
+.run/
 .idea/
 .vscode/
 __pycache__/

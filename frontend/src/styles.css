@@ -181,6 +181,14 @@ body {
   padding: 0;
 }
 
+.commit-context-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #e6eaf2;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
 @media (max-width: 1200px) {
   .split-grid,
   .chat-layout,

@@ -7,6 +7,7 @@ from app.db.session import get_db
 from app.models import ChatMessage, ChatSession
 from app.schemas.chat import ChatAnswer, ChatMessageCreate, ChatMessageRead, ChatSessionCreate
 from app.schemas.common import ApiResponse
+from app.services.commit_context.service import CommitContextError
 from app.services.llm.exceptions import (
     LLMConfigurationError,
     LLMInvocationError,
@@ -40,12 +41,13 @@ def list_chat_sessions(project_id: str, db: Session = Depends(get_db)) -> ApiRes
 def send_chat_message(
     session_id: str, payload: ChatMessageCreate, db: Session = Depends(get_db)
 ) -> ApiResponse[ChatAnswer]:
-    memory_service = MemoryService(db)
     session = db.get(ChatSession, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="chat session not found")
     try:
-        graph_result = run_chat_graph(db, session, payload.content)
+        graph_result = run_chat_graph(db, session, payload)
+    except CommitContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (LLMInvocationError, LLMOutputParseError, ValidationError) as exc:

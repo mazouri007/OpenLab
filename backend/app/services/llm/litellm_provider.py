@@ -53,7 +53,7 @@ class LiteLLMProvider(LLMProvider):
             )
         try:
             return extract_json_object(content)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             try:
                 repaired = self._repair_json_output(content, schema_name, model_config)
                 return extract_json_object(repaired)

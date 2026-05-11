@@ -167,11 +167,17 @@ class RagService:
         question: str,
         short_term_summary: str = "",
         long_term_memory: list[str] | None = None,
+        extra_context: str = "",
+        extra_citations: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+        system_prompt: str = RAG_ANSWER_PROMPT,
     ) -> ChatAnswer:
         model_config = resolve_model_config(self.db, project_id)
         rewritten_queries = self._rewrite_query(question, model_config)
         chunks = self._hybrid_retrieve(project_id, rewritten_queries, model_config)
-        context = self._build_context(chunks)
+        knowledge_context = self._build_context(chunks)
+        context_parts = [part for part in [extra_context, knowledge_context] if part]
+        context = "\n\n".join(context_parts)
         answer_result = self._answer_with_citations(
             question=question,
             context=context,
@@ -179,15 +185,22 @@ class RagService:
             short_term_summary=short_term_summary,
             long_term_memory=long_term_memory or [],
             model_config=model_config,
+            system_prompt=system_prompt,
         )
+        citations = _merge_citations(extra_citations or [], [
+            item.model_dump() for item in answer_result.citations
+        ])
         return ChatAnswer(
             answer=answer_result.answer,
-            citations=[item.model_dump() for item in answer_result.citations],
+            citations=citations,
             used_memory=long_term_memory or [],
-            used_documents=[item.source_title or item.chunk_id for item in answer_result.citations],
+            used_documents=[
+                str(item.get("source_title") or item.get("chunk_id")) for item in citations
+            ],
             rewritten_queries=rewritten_queries,
             reasoning_summary=answer_result.reasoning_summary,
             confidence=answer_result.confidence,
+            metadata=metadata or {},
         )
 
     def _rewrite_query(self, question: str, model_config: dict[str, Any]) -> list[str]:
@@ -275,10 +288,11 @@ class RagService:
         short_term_summary: str,
         long_term_memory: list[str],
         model_config: dict[str, Any],
+        system_prompt: str = RAG_ANSWER_PROMPT,
     ) -> RagAnswerOutput:
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", RAG_ANSWER_PROMPT),
+                ("system", system_prompt),
                 (
                     "user",
                     "问题：{question}\n重写查询：{rewritten_queries}\n短期摘要：{short_term_summary}\n"
@@ -357,3 +371,17 @@ class RagService:
         if left_norm == 0 or right_norm == 0:
             return 0.0
         return numerator / (left_norm * right_norm)
+
+
+def _merge_citations(
+    preferred: list[dict[str, Any]], generated: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*preferred, *generated]:
+        chunk_id = str(item.get("chunk_id") or "")
+        if not chunk_id or chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        merged.append(item)
+    return merged

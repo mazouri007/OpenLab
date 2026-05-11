@@ -15,6 +15,15 @@ import type {
 } from "../types/domain";
 import type { ApiResponse } from "../types/api";
 
+export type ChatMessagePayload = {
+  content: string;
+  context_type?: "general" | "github_commit";
+  repository_id?: string;
+  commit_sha?: string;
+  intent?: "auto" | "explain" | "compliance" | "review";
+  persist_review?: boolean;
+};
+
 export async function listProjects() {
   const response = await apiClient.get<ApiResponse<Project[]>>("/projects");
   return response.data.data;
@@ -75,10 +84,11 @@ export async function listChatMessages(sessionId: string) {
   return response.data.data;
 }
 
-export async function sendChatMessage(sessionId: string, content: string) {
+export async function sendChatMessage(sessionId: string, payload: string | ChatMessagePayload) {
+  const body = typeof payload === "string" ? { content: payload } : payload;
   const response = await apiClient.post<ApiResponse<ChatAnswer>>(
     `/chat/sessions/${sessionId}/messages`,
-    { content },
+    body,
     { timeout: 120000 },
   );
   return response.data.data;

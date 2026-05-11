@@ -18,6 +18,7 @@ dependencies = [
   "langchain-core>=0.2.10",
   "langgraph>=0.1.1",
   "litellm>=1.40.0",
+  "mcp[cli]>=1.0.0",
   "faiss-cpu>=1.8.0",
   "pygithub>=2.3.0",
   "pypdf>=4.2.0",

@@ -5,6 +5,7 @@ from app.db.session import get_db
 from app.models import CodeReviewResult, CodeReviewTask
 from app.schemas.common import ApiResponse
 from app.schemas.review import ReviewRequest, ReviewResultRead, ReviewTaskRead
+from app.services.commit_context.service import CommitContextError
 from app.services.review.service import ReviewService
 from app.services.tasks.dispatcher import enqueue_review_task
 
@@ -21,7 +22,10 @@ def create_review(
     task.progress_stage = "queued"
     db.add(task)
     db.commit()
-    enqueue_review_task(task.id)
+    try:
+        enqueue_review_task(task.id)
+    except CommitContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ApiResponse(data=ReviewTaskRead.model_validate(task))
 
 
@@ -37,7 +41,10 @@ def create_review_from_github(
     task.progress_stage = "queued"
     db.add(task)
     db.commit()
-    enqueue_review_task(task.id)
+    try:
+        enqueue_review_task(task.id)
+    except CommitContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ApiResponse(data=ReviewTaskRead.model_validate(task))
 
 

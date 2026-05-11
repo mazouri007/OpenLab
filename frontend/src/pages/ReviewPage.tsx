@@ -1,9 +1,15 @@
-import { Button, Card, Drawer, Form, Input, Select, Space, Typography } from "antd";
+import { Button, Card, Drawer, Form, Input, InputNumber, Select, Space, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { createReviewTask, getReviewResult, getTaskStatus, listReviewTasks } from "../api/platform";
+import {
+  createReviewTask,
+  getReviewResult,
+  getTaskStatus,
+  listRepositories,
+  listReviewTasks,
+} from "../api/platform";
 import { PageHeader } from "../components/PageHeader";
 import { ResultPanel } from "../components/ResultPanel";
 import { StatusTag } from "../components/StatusTag";
@@ -14,8 +20,11 @@ import type { ReviewResult, ReviewTask, TaskStatus } from "../types/domain";
 export default function ReviewPage() {
   const { projectId } = useCurrentProject();
   const queryClient = useQueryClient();
+  const [form] = Form.useForm();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selectedTask, setSelectedTask] = useState<ReviewTask | null>(null);
+  const sourceType = Form.useWatch("source_type", form) ?? "snippet";
+  const usesGithubSource = sourceType === "github_commit" || sourceType === "github_pr";
 
   const taskQuery = useQuery({
     queryKey: ["reviews", projectId],
@@ -38,6 +47,21 @@ export default function ReviewPage() {
     queryFn: () => getReviewResult(selectedTask!.id),
     enabled: !!selectedTask?.id && statusQuery.data?.status === "completed",
   });
+
+  const reposQuery = useQuery({
+    queryKey: ["repos", projectId],
+    queryFn: () => listRepositories(projectId),
+    enabled: !!projectId,
+  });
+
+  const repoOptions = useMemo(
+    () =>
+      (reposQuery.data ?? []).map((repo) => ({
+        value: repo.id,
+        label: repo.repo_full_name,
+      })),
+    [reposQuery.data],
+  );
 
   const createMutation = useMutation({
     mutationFn: (payload: Record<string, unknown>) => createReviewTask(projectId, payload),
@@ -140,6 +164,7 @@ export default function ReviewPage() {
         destroyOnClose
       >
         <Form
+          form={form}
           layout="vertical"
           onFinish={(values) => createMutation.mutate(values)}
           initialValues={{ source_type: "snippet", language: "python" }}
@@ -171,9 +196,32 @@ export default function ReviewPage() {
               />
             </Form.Item>
           </Space>
-          <Form.Item label="代码 / Diff / PR 内容" name="content" rules={[{ required: true }]}>
-            <Input.TextArea rows={14} placeholder="粘贴代码、diff 或 PR 摘要" />
-          </Form.Item>
+          {usesGithubSource ? (
+            <Form.Item label="GitHub 仓库" name="repository_id" rules={[{ required: true }]}>
+              <Select
+                showSearch
+                placeholder="选择已同步仓库"
+                options={repoOptions}
+                loading={reposQuery.isLoading}
+                optionFilterProp="label"
+              />
+            </Form.Item>
+          ) : null}
+          {sourceType === "github_commit" ? (
+            <Form.Item label="Commit SHA" name="commit_sha" rules={[{ required: true }]}>
+              <Input placeholder="例如：a1b2c3d4" />
+            </Form.Item>
+          ) : null}
+          {sourceType === "github_pr" ? (
+            <Form.Item label="PR 编号" name="pr_number" rules={[{ required: true }]}>
+              <InputNumber min={1} precision={0} style={{ width: "100%" }} />
+            </Form.Item>
+          ) : null}
+          {!usesGithubSource ? (
+            <Form.Item label="代码 / Diff 内容" name="content" rules={[{ required: true }]}>
+              <Input.TextArea rows={14} placeholder="粘贴代码或 diff" />
+            </Form.Item>
+          ) : null}
           <Button htmlType="submit" type="primary" loading={createMutation.isPending}>
             提交异步任务
           </Button>

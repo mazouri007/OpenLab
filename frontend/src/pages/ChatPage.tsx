@@ -3,10 +3,12 @@ import {
   App as AntApp,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   List,
   Modal,
+  Select,
   Skeleton,
   Space,
   Typography,
@@ -16,9 +18,11 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   createChatSession,
+  listRepositories,
   listChatMessages,
   listChatSessions,
   sendChatMessage,
+  type ChatMessagePayload,
 } from "../api/platform";
 import { CitationList } from "../components/CitationList";
 import { MessageContent } from "../components/MessageContent";
@@ -38,6 +42,8 @@ type CreateSessionForm = {
   title: string;
 };
 
+type CommitIntent = "auto" | "explain" | "compliance" | "review";
+
 export default function ChatPage() {
   const { projectId } = useCurrentProject();
   const { message } = AntApp.useApp();
@@ -47,6 +53,11 @@ export default function ChatPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [selectedSession, setSelectedSession] = useState<ChatSession | null>(null);
   const [lastExchange, setLastExchange] = useState<LocalExchange | null>(null);
+  const [commitEnabled, setCommitEnabled] = useState(false);
+  const [commitRepositoryId, setCommitRepositoryId] = useState<string>();
+  const [commitSha, setCommitSha] = useState("");
+  const [commitIntent, setCommitIntent] = useState<CommitIntent>("auto");
+  const [persistReview, setPersistReview] = useState(true);
 
   const sessionsQuery = useQuery({
     queryKey: ["chat-sessions", projectId],
@@ -66,6 +77,21 @@ export default function ChatPage() {
     enabled: !!selectedSession?.id,
   });
 
+  const reposQuery = useQuery({
+    queryKey: ["repos", projectId],
+    queryFn: () => listRepositories(projectId),
+    enabled: !!projectId,
+  });
+
+  const repoOptions = useMemo(
+    () =>
+      (reposQuery.data ?? []).map((repo) => ({
+        value: repo.id,
+        label: repo.repo_full_name,
+      })),
+    [reposQuery.data],
+  );
+
   const createSessionMutation = useMutation({
     mutationFn: (values: CreateSessionForm) => createChatSession(projectId, values.title.trim()),
     onSuccess: async (session) => {
@@ -81,10 +107,10 @@ export default function ChatPage() {
   });
 
   const sendMutation = useMutation({
-    mutationFn: (content: string) => sendChatMessage(selectedSession!.id, content),
-    onSuccess: async (answer, question) => {
+    mutationFn: (payload: ChatMessagePayload) => sendChatMessage(selectedSession!.id, payload),
+    onSuccess: async (answer, payload) => {
       if (selectedSession) {
-        setLastExchange({ sessionId: selectedSession.id, question, answer });
+        setLastExchange({ sessionId: selectedSession.id, question: payload.content, answer });
       }
       setInput("");
       await queryClient.invalidateQueries({ queryKey: ["chat-messages", selectedSession?.id] });
@@ -136,13 +162,32 @@ export default function ChatPage() {
     if (!selectedSession || !content) {
       return;
     }
-    sendMutation.mutate(content);
+    if (commitEnabled && (!commitRepositoryId || !commitSha.trim())) {
+      message.warning("请选择仓库并填写 commit SHA。");
+      return;
+    }
+    const payload: ChatMessagePayload = commitEnabled
+      ? {
+          content,
+          context_type: "github_commit",
+          repository_id: commitRepositoryId,
+          commit_sha: commitSha.trim(),
+          intent: commitIntent,
+          persist_review: persistReview,
+        }
+      : { content };
+    sendMutation.mutate(payload);
   };
 
   const submitCreateSession = async () => {
     const values = await form.validateFields();
     createSessionMutation.mutate(values);
   };
+
+  const canSubmit =
+    !!selectedSession &&
+    !!input.trim() &&
+    (!commitEnabled || (!!commitRepositoryId && !!commitSha.trim()));
 
   return (
     <div className="page-grid">
@@ -229,10 +274,56 @@ export default function ChatPage() {
               }
             }}
           />
+          <div className="commit-context-panel">
+            <Checkbox
+              checked={commitEnabled}
+              onChange={(event) => setCommitEnabled(event.target.checked)}
+            >
+              关联 GitHub Commit
+            </Checkbox>
+            {commitEnabled ? (
+              <Space wrap size="middle" style={{ marginTop: 12 }}>
+                <Select
+                  showSearch
+                  style={{ width: 260 }}
+                  placeholder="选择仓库"
+                  options={repoOptions}
+                  loading={reposQuery.isLoading}
+                  value={commitRepositoryId}
+                  optionFilterProp="label"
+                  onChange={setCommitRepositoryId}
+                />
+                <Input
+                  style={{ width: 220 }}
+                  placeholder="commit SHA"
+                  value={commitSha}
+                  onChange={(event) => setCommitSha(event.target.value)}
+                />
+                <Select<CommitIntent>
+                  style={{ width: 150 }}
+                  value={commitIntent}
+                  onChange={setCommitIntent}
+                  options={[
+                    { value: "auto", label: "自动判断" },
+                    { value: "explain", label: "功能说明" },
+                    { value: "compliance", label: "规范判断" },
+                    { value: "review", label: "代码审查" },
+                  ]}
+                />
+                <Checkbox
+                  checked={persistReview}
+                  disabled={!["auto", "compliance", "review"].includes(commitIntent)}
+                  onChange={(event) => setPersistReview(event.target.checked)}
+                >
+                  保存审查任务
+                </Checkbox>
+              </Space>
+            ) : null}
+          </div>
           <Button
             type="primary"
             style={{ marginTop: 12 }}
-            disabled={!selectedSession || !input.trim()}
+            disabled={!canSubmit}
             loading={sendMutation.isPending}
             onClick={submitQuestion}
           >
@@ -257,6 +348,12 @@ export default function ChatPage() {
               <strong>推理摘要：</strong>
               {lastAnswer?.reasoning_summary || "发送消息后显示"}
             </Typography.Paragraph>
+            {lastAnswer?.metadata?.review_task_id ? (
+              <Typography.Paragraph>
+                <strong>审查任务：</strong>
+                {String(lastAnswer.metadata.review_task_id)}
+              </Typography.Paragraph>
+            ) : null}
             <Typography.Text type="secondary">
               置信度：{lastAnswer ? lastAnswer.confidence.toFixed(2) : "0.00"}
             </Typography.Text>

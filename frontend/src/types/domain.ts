@@ -77,6 +77,7 @@ export type ChatAnswer = {
   rewritten_queries: string[];
   reasoning_summary: string;
   confidence: number;
+  metadata: Record<string, unknown>;
 };
 
 export type KnowledgeDocument = {
