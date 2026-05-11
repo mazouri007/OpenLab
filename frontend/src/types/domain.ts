@@ -83,7 +83,11 @@ export type KnowledgeDocument = {
   id: string;
   title: string;
   source_type: string;
+  source_name?: string | null;
   parse_status: string;
+  chunk_count: number;
+  error_message?: string | null;
+  created_at?: string | null;
 };
 
 export type GithubRepository = {

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from hashlib import sha256
+from hashlib import md5, sha256
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -12,6 +12,16 @@ from app.agents.prompt_catalog import RAG_ANSWER_PROMPT, RAG_REWRITE_PROMPT
 from app.models import KnowledgeChunk, KnowledgeDocument
 from app.schemas.chat import ChatAnswer
 from app.schemas.kb import KnowledgeDocumentCreate
+from app.services.rag.chunking import ChunkDraft, chunk_elements
+from app.services.rag.document_parser import (
+    DocumentParseError,
+    EmptyDocumentError,
+    ParsedElement,
+    UnsupportedDocumentTypeError,
+    elements_to_text,
+    parse_document_bytes,
+    parse_text_content,
+)
 from app.services.llm.exceptions import LLMConfigurationError, LLMInvocationError
 from app.services.llm.litellm_provider import LiteLLMProvider
 from app.services.llm.provider_resolver import resolve_model_config
@@ -23,6 +33,7 @@ class RagService:
         self.llm_provider = LiteLLMProvider()
 
     def create_document(self, project_id: str, payload: KnowledgeDocumentCreate) -> KnowledgeDocument:
+        elements = parse_text_content(payload.raw_text, payload.source_name, parser="manual_text")
         document = KnowledgeDocument(
             project_id=project_id,
             title=payload.title,
@@ -31,6 +42,58 @@ class RagService:
             raw_content=payload.raw_text,
             content_hash=sha256(payload.raw_text.encode("utf-8")).hexdigest(),
             parse_status="pending",
+            metadata_json={
+                "parser": "manual_text",
+                "parsed_elements": [element.to_dict() for element in elements],
+            },
+        )
+        self.db.add(document)
+        self.db.commit()
+        self.db.refresh(document)
+        return document
+
+    def create_file_document(
+        self,
+        project_id: str,
+        filename: str,
+        content: bytes,
+        title: str | None = None,
+        content_type: str | None = None,
+    ) -> KnowledgeDocument:
+        try:
+            elements = parse_document_bytes(content, filename, content_type)
+        except UnsupportedDocumentTypeError:
+            raise
+        except (DocumentParseError, EmptyDocumentError) as exc:
+            document = KnowledgeDocument(
+                project_id=project_id,
+                title=title or filename,
+                source_type="file",
+                source_name=filename,
+                raw_content="",
+                content_hash=sha256(content).hexdigest(),
+                parse_status="failed",
+                error_message=str(exc),
+                metadata_json={"parser_error": str(exc)},
+            )
+            self.db.add(document)
+            self.db.commit()
+            self.db.refresh(document)
+            return document
+
+        parser = elements[0].metadata.get("parser", "file") if elements else "file"
+        document = KnowledgeDocument(
+            project_id=project_id,
+            title=title or filename,
+            source_type="file",
+            source_name=filename,
+            raw_content=elements_to_text(elements),
+            content_hash=sha256(content).hexdigest(),
+            parse_status="pending",
+            metadata_json={
+                "parser": parser,
+                "parsed_elements": [element.to_dict() for element in elements],
+            },
         )
         self.db.add(document)
         self.db.commit()
@@ -39,6 +102,7 @@ class RagService:
 
     def index_document(self, document: KnowledgeDocument) -> KnowledgeDocument:
         document.parse_status = "indexing"
+        document.error_message = None
         self.db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id == document.id).delete()
         model_config = None
         try:
@@ -46,22 +110,38 @@ class RagService:
         except LLMConfigurationError:
             model_config = None
 
-        chunks = self._semantic_chunks(document.raw_content or "", document.title, document.source_name)
+        chunks = self._chunks_for_document(document)
+        if not chunks:
+            document.parse_status = "failed"
+            document.error_message = "文档没有可索引文本，扫描版 PDF 暂不支持 OCR。"
+            self.db.add(document)
+            self.db.commit()
+            self.db.refresh(document)
+            return document
+
         embeddings: list[list[float]] | None = None
+        indexed_contents = [self._indexed_content(document, chunk) for chunk in chunks]
         if chunks and model_config is not None:
             try:
                 embeddings = self.llm_provider.embed_texts(
-                    [item["content"] for item in chunks], model_config=model_config
+                    indexed_contents, model_config=model_config
                 )
             except LLMInvocationError:
                 embeddings = None
 
         for index, chunk in enumerate(chunks):
+            chunk_ref = f"{document.id}_{index + 1:04d}"
+            content_hash = md5(chunk.content.encode("utf-8")).hexdigest()
             metadata = {
                 "title": document.title,
                 "source_type": document.source_type,
                 "source_name": document.source_name,
-                "section": chunk["section"],
+                "chunk_id": chunk_ref,
+                "content_hash": content_hash,
+                "doc_id": document.id,
+                "chunk_index": index,
+                "indexed_content": indexed_contents[index],
+                **chunk.metadata,
             }
             if embeddings:
                 metadata["embedding"] = embeddings[index]
@@ -70,8 +150,8 @@ class RagService:
                     document_id=document.id,
                     project_id=document.project_id,
                     chunk_index=index,
-                    content=chunk["content"],
-                    token_count=len(chunk["content"].split()),
+                    content=chunk.content,
+                    token_count=len(chunk.content.split()),
                     metadata_json=metadata,
                 )
             )
@@ -140,7 +220,7 @@ class RagService:
             return []
         keyword_scores: dict[str, float] = {}
         for chunk in chunks:
-            text = chunk.content.lower()
+            text = str(chunk.metadata_json.get("indexed_content") or chunk.content).lower()
             score = 0.0
             for query in queries:
                 for token in query.lower().split():
@@ -176,9 +256,13 @@ class RagService:
     def _build_context(self, chunks: list[KnowledgeChunk]) -> str:
         blocks = []
         for chunk in chunks:
+            source_location = chunk.metadata_json.get("source_location")
+            source_line = f"来源：{chunk.metadata_json.get('source_name')}"
+            if source_location:
+                source_line += f"（{source_location}）"
             blocks.append(
-                f"[{chunk.id}] 标题：{chunk.metadata_json.get('title')}\n"
-                f"来源：{chunk.metadata_json.get('source_name')}\n"
+                f"[{chunk.metadata_json.get('chunk_id') or chunk.id}] 标题：{chunk.metadata_json.get('title')}\n"
+                f"{source_line}\n"
                 f"内容：{chunk.content}"
             )
         return "\n\n".join(blocks)
@@ -228,35 +312,33 @@ class RagService:
             ]
         return RagAnswerOutput.model_validate(result)
 
+    def _chunks_for_document(self, document: KnowledgeDocument) -> list[ChunkDraft]:
+        elements = self._parsed_elements_for_document(document)
+        return chunk_elements(elements, document.title, document.source_name)
+
     @staticmethod
-    def _semantic_chunks(raw_text: str, title: str, source_name: str | None) -> list[dict[str, str]]:
-        blocks = [block.strip() for block in raw_text.split("\n\n") if block.strip()]
-        if not blocks:
-            blocks = [raw_text.strip()] if raw_text.strip() else []
-        chunks: list[dict[str, str]] = []
-        buffer = ""
-        section_index = 1
-        for block in blocks:
-            if len(buffer) + len(block) < 650:
-                buffer = f"{buffer}\n\n{block}".strip()
-                continue
-            if buffer:
-                chunks.append(
-                    {
-                        "content": buffer,
-                        "section": f"{title}:{source_name or 'section'}:{section_index}",
-                    }
-                )
-                section_index += 1
-            buffer = block
-        if buffer:
-            chunks.append(
-                {
-                    "content": buffer,
-                    "section": f"{title}:{source_name or 'section'}:{section_index}",
-                }
-            )
-        return chunks
+    def _indexed_content(document: KnowledgeDocument, chunk: ChunkDraft) -> str:
+        lines = [f"文档标题：{document.title}"]
+        section_path = chunk.metadata.get("section_path")
+        if isinstance(section_path, list) and section_path:
+            lines.append("标题路径：" + " > ".join(str(item) for item in section_path))
+        source_location = chunk.metadata.get("source_location")
+        if source_location:
+            lines.append(f"来源位置：{source_location}")
+        if chunk.metadata.get("chunk_type") == "table":
+            lines.append("表格内容：")
+        else:
+            lines.append("正文：")
+        lines.append(chunk.content)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parsed_elements_for_document(document: KnowledgeDocument) -> list[ParsedElement]:
+        metadata_json = document.metadata_json if isinstance(document.metadata_json, dict) else {}
+        parsed = metadata_json.get("parsed_elements")
+        if isinstance(parsed, list):
+            return [ParsedElement.from_dict(item) for item in parsed if isinstance(item, dict)]
+        return parse_text_content(document.raw_content or "", document.source_name, parser="legacy_text")
 
     @staticmethod
     def _average_vector(vectors: list[list[float]]) -> list[float]:

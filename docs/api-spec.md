@@ -5,5 +5,5 @@
 - `POST /api/v1/projects/{project_id}/chat/sessions`
 - `POST /api/v1/projects/{project_id}/github/integrations`
 - `POST /api/v1/projects/{project_id}/kb/documents`
+- `POST /api/v1/projects/{project_id}/kb/documents/upload`
 - `POST /api/v1/projects/{project_id}/models/providers`
-

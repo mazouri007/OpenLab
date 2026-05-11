@@ -65,6 +65,8 @@ class KnowledgeDocument(TimestampMixin, Base):
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     parse_status: Mapped[str] = mapped_column(String(50), default="pending")
     raw_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class KnowledgeChunk(TimestampMixin, Base):
