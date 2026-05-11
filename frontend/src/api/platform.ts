@@ -99,6 +99,20 @@ export async function createDocument(projectId: string, payload: Record<string, 
   return response.data.data;
 }
 
+export async function uploadDocument(projectId: string, payload: { file: File; title?: string }) {
+  const formData = new FormData();
+  formData.append("file", payload.file);
+  if (payload.title) {
+    formData.append("title", payload.title);
+  }
+  const response = await apiClient.post<ApiResponse<KnowledgeDocument>>(
+    `/projects/${projectId}/kb/documents/upload`,
+    formData,
+    { timeout: 120000 },
+  );
+  return response.data.data;
+}
+
 export async function listRepositories(projectId: string) {
   const response = await apiClient.get<ApiResponse<GithubRepository[]>>(
     `/projects/${projectId}/github/repositories`,

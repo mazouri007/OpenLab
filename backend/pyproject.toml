@@ -20,6 +20,10 @@ dependencies = [
   "litellm>=1.40.0",
   "faiss-cpu>=1.8.0",
   "pygithub>=2.3.0",
+  "pypdf>=4.2.0",
+  "python-docx>=1.1.2",
+  "openpyxl>=3.1.5",
+  "charset-normalizer>=3.3.2",
 ]
 
 [project.optional-dependencies]
