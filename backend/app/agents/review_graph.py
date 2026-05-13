@@ -22,7 +22,7 @@ from app.models import (
 )
 from app.services.commit_context.service import CommitContextService
 from app.services.llm.exceptions import LLMOutputParseError
-from app.services.llm.litellm_provider import LiteLLMProvider
+from app.services.llm.langchain_provider import LangChainLLMProvider
 
 
 class ReviewGraphState(TypedDict, total=False):
@@ -44,7 +44,7 @@ class ReviewGraphState(TypedDict, total=False):
 def run_review_graph(
     db: Session, task: CodeReviewTask, model_config: dict[str, Any]
 ) -> ReviewGraphState:
-    llm_provider = LiteLLMProvider()
+    llm_provider = LangChainLLMProvider()
 
     def load_task_context(_: ReviewGraphState) -> ReviewGraphState:
         task.progress_stage = "load_task_context"
@@ -57,7 +57,7 @@ def run_review_graph(
             "language": task.language.lower(),
             "source_type": task.source_type,
             "raw_input": task.input_payload_json,
-            "model_name": model_config["chat_model"],
+            "model_name": model_config["chat"]["model"],
         }
 
     def normalize_source(state: ReviewGraphState) -> ReviewGraphState:

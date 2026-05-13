@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from typing import Any
 
 
@@ -19,7 +20,17 @@ class LLMProvider(ABC):
         system_prompt: str,
         user_prompt: str,
         model_config: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def chat_text_stream(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model_config: dict[str, Any] | None = None,
+    ) -> Iterator[str]:
         raise NotImplementedError
 
     @abstractmethod

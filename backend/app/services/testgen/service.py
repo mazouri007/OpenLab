@@ -53,7 +53,7 @@ class TestGenerationService:
             result.raw_output_json = {
                 "plan_result": graph_result["plan_result"],
                 "code_result": code_result,
-                "model_name": model_config["chat_model"],
+                "model_name": model_config["chat"]["model"],
             }
             task.status = "completed"
             task.progress_stage = "completed"

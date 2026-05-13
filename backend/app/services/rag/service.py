@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math
+from collections.abc import Generator
 from hashlib import md5, sha256
 from typing import Any
 
@@ -23,14 +23,23 @@ from app.services.rag.document_parser import (
     parse_text_content,
 )
 from app.services.llm.exceptions import LLMConfigurationError, LLMInvocationError
-from app.services.llm.litellm_provider import LiteLLMProvider
+from app.services.llm.langchain_provider import LangChainLLMProvider
 from app.services.llm.provider_resolver import resolve_model_config
+from app.services.rag.vector_store import RagVectorStore
+
+
+ChatStreamEvent = tuple[str, dict[str, Any]]
 
 
 class RagService:
     def __init__(self, db: Session) -> None:
         self.db = db
-        self.llm_provider = LiteLLMProvider()
+        self.llm_provider = LangChainLLMProvider()
+        try:
+            self.vector_store: RagVectorStore | None = RagVectorStore()
+        except Exception:  # noqa: BLE001
+            self.vector_store = None
+        self._last_vector_retrieval_failed = False
 
     def create_document(self, project_id: str, payload: KnowledgeDocumentCreate) -> KnowledgeDocument:
         elements = parse_text_content(payload.raw_text, payload.source_name, parser="manual_text")
@@ -103,6 +112,11 @@ class RagService:
     def index_document(self, document: KnowledgeDocument) -> KnowledgeDocument:
         document.parse_status = "indexing"
         document.error_message = None
+        if self.vector_store is not None:
+            try:
+                self.vector_store.delete_document(document.id)
+            except Exception as exc:  # noqa: BLE001
+                document.error_message = f"ChromaDB 旧向量清理失败，继续重建关键词索引：{exc}"
         self.db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id == document.id).delete()
         model_config = None
         try:
@@ -129,6 +143,7 @@ class RagService:
             except LLMInvocationError:
                 embeddings = None
 
+        chunk_rows: list[tuple[KnowledgeChunk, str, dict[str, Any]]] = []
         for index, chunk in enumerate(chunks):
             chunk_ref = f"{document.id}_{index + 1:04d}"
             content_hash = md5(chunk.content.encode("utf-8")).hexdigest()
@@ -143,18 +158,48 @@ class RagService:
                 "indexed_content": indexed_contents[index],
                 **chunk.metadata,
             }
-            if embeddings:
-                metadata["embedding"] = embeddings[index]
-            self.db.add(
-                KnowledgeChunk(
-                    document_id=document.id,
-                    project_id=document.project_id,
-                    chunk_index=index,
-                    content=chunk.content,
-                    token_count=len(chunk.content.split()),
-                    metadata_json=metadata,
-                )
+            row = KnowledgeChunk(
+                document_id=document.id,
+                project_id=document.project_id,
+                chunk_index=index,
+                content=chunk.content,
+                token_count=len(chunk.content.split()),
+                metadata_json=metadata,
             )
+            self.db.add(row)
+            chunk_rows.append((row, indexed_contents[index], metadata))
+        self.db.flush()
+
+        vector_indexed = False
+        if embeddings and self.vector_store is not None:
+            try:
+                self.vector_store.upsert_chunks(
+                    [
+                        {
+                            "id": row.id,
+                            "embedding": embeddings[index],
+                            "document": indexed_content,
+                            "metadata": {
+                                "project_id": row.project_id,
+                                "document_id": row.document_id,
+                                "chunk_id": metadata["chunk_id"],
+                                "source_name": metadata.get("source_name"),
+                                "title": metadata.get("title"),
+                            },
+                        }
+                        for index, (row, indexed_content, metadata) in enumerate(chunk_rows)
+                    ]
+                )
+                vector_indexed = True
+            except Exception as exc:  # noqa: BLE001
+                document.error_message = f"ChromaDB 向量索引失败，已保留关键词索引：{exc}"
+        elif embeddings:
+            document.error_message = "ChromaDB 向量库不可用，已保留关键词索引。"
+
+        document.metadata_json = {
+            **(document.metadata_json if isinstance(document.metadata_json, dict) else {}),
+            "vector_indexed": vector_indexed,
+        }
         document.parse_status = "indexed"
         self.db.add(document)
         self.db.commit()
@@ -190,6 +235,9 @@ class RagService:
         citations = _merge_citations(extra_citations or [], [
             item.model_dump() for item in answer_result.citations
         ])
+        answer_metadata = dict(metadata or {})
+        if self._last_vector_retrieval_failed:
+            answer_metadata["vector_retrieval_failed"] = True
         return ChatAnswer(
             answer=answer_result.answer,
             citations=citations,
@@ -200,7 +248,7 @@ class RagService:
             rewritten_queries=rewritten_queries,
             reasoning_summary=answer_result.reasoning_summary,
             confidence=answer_result.confidence,
-            metadata=metadata or {},
+            metadata=answer_metadata,
         )
 
     def _rewrite_query(self, question: str, model_config: dict[str, Any]) -> list[str]:
@@ -225,9 +273,73 @@ class RagService:
         except Exception:  # noqa: BLE001
             return [question, f"实验室规范 {question}", f"项目背景 {question}"]
 
+    def stream_answer(
+        self,
+        project_id: str,
+        question: str,
+        short_term_summary: str = "",
+        long_term_memory: list[str] | None = None,
+        extra_context: str = "",
+        extra_citations: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+        system_prompt: str = RAG_ANSWER_PROMPT,
+    ) -> Generator[ChatStreamEvent, None, ChatAnswer]:
+        model_config = resolve_model_config(self.db, project_id)
+        yield ("status", {"stage": "retrieve", "message": "正在改写问题并检索知识库"})
+        rewritten_queries = self._rewrite_query(question, model_config)
+        chunks = self._hybrid_retrieve(project_id, rewritten_queries, model_config)
+        knowledge_context = self._build_context(chunks)
+        context_parts = [part for part in [extra_context, knowledge_context] if part]
+        context = "\n\n".join(context_parts)
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", _streaming_system_prompt(system_prompt)),
+                (
+                    "user",
+                    "问题：{question}\n重写查询：{rewritten_queries}\n短期摘要：{short_term_summary}\n"
+                    "长期记忆：{long_term_memory}\n知识上下文：\n{context}",
+                ),
+            ]
+        )
+        messages = prompt.invoke(
+            {
+                "question": question,
+                "rewritten_queries": rewritten_queries,
+                "short_term_summary": short_term_summary,
+                "long_term_memory": long_term_memory or [],
+                "context": context or "无命中上下文",
+            }
+        ).to_messages()
+        yield ("status", {"stage": "generate", "message": "正在流式生成回答"})
+        answer_parts: list[str] = []
+        for delta in self.llm_provider.chat_text_stream(
+            system_prompt=messages[0].content,
+            user_prompt=messages[1].content,
+            model_config=model_config,
+        ):
+            answer_parts.append(delta)
+            yield ("delta", {"content": delta})
+        citations = _merge_citations(extra_citations or [], _citations_from_chunks(chunks))
+        answer_metadata = dict(metadata or {})
+        if self._last_vector_retrieval_failed:
+            answer_metadata["vector_retrieval_failed"] = True
+        return ChatAnswer(
+            answer="".join(answer_parts),
+            citations=citations,
+            used_memory=long_term_memory or [],
+            used_documents=[
+                str(item.get("source_title") or item.get("chunk_id")) for item in citations
+            ],
+            rewritten_queries=rewritten_queries,
+            reasoning_summary="基于重写查询、知识库片段和会话记忆流式生成回答。",
+            confidence=0.72 if citations else 0.45,
+            metadata=answer_metadata,
+        )
+
     def _hybrid_retrieve(
         self, project_id: str, queries: list[str], model_config: dict[str, Any]
     ) -> list[KnowledgeChunk]:
+        self._last_vector_retrieval_failed = False
         chunks = self.db.query(KnowledgeChunk).filter(KnowledgeChunk.project_id == project_id).all()
         if not chunks:
             return []
@@ -245,11 +357,12 @@ class RagService:
         try:
             query_vectors = self.llm_provider.embed_texts(queries, model_config=model_config)
             aggregate_query = self._average_vector(query_vectors)
-            for chunk in chunks:
-                embedding = chunk.metadata_json.get("embedding")
-                if embedding:
-                    vector_scores[chunk.id] = self._cosine_similarity(aggregate_query, embedding)
+            if self.vector_store is None:
+                raise RuntimeError("ChromaDB vector store is unavailable.")
+            for hit in self.vector_store.query(project_id, aggregate_query):
+                vector_scores[hit.chunk_id] = hit.score
         except Exception:  # noqa: BLE001
+            self._last_vector_retrieval_failed = True
             vector_scores = {}
 
         ranked = sorted(
@@ -361,18 +474,6 @@ class RagService:
         size = len(vectors[0])
         return [sum(vector[idx] for vector in vectors) / len(vectors) for idx in range(size)]
 
-    @staticmethod
-    def _cosine_similarity(left: list[float], right: list[float]) -> float:
-        if not left or not right:
-            return 0.0
-        numerator = sum(a * b for a, b in zip(left, right, strict=False))
-        left_norm = math.sqrt(sum(a * a for a in left))
-        right_norm = math.sqrt(sum(b * b for b in right))
-        if left_norm == 0 or right_norm == 0:
-            return 0.0
-        return numerator / (left_norm * right_norm)
-
-
 def _merge_citations(
     preferred: list[dict[str, Any]], generated: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -385,3 +486,31 @@ def _merge_citations(
         seen.add(chunk_id)
         merged.append(item)
     return merged
+
+
+def _citations_from_chunks(chunks: list[KnowledgeChunk]) -> list[dict[str, Any]]:
+    citations: list[dict[str, Any]] = []
+    for chunk in chunks:
+        metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
+        citations.append(
+            {
+                "chunk_id": str(metadata.get("chunk_id") or chunk.id),
+                "snippet": chunk.content[:240],
+                "source_type": "knowledge_chunk",
+                "source_title": str(metadata.get("title") or metadata.get("source_name") or "知识片段"),
+            }
+        )
+    return citations
+
+
+def _streaming_system_prompt(system_prompt: str) -> str:
+    if "GitHub commit" in system_prompt:
+        return (
+            "你是实验室研发平台中的 GitHub commit 问答与代码审查助手。"
+            "只能基于给定的 GitHub commit 上下文、知识库上下文、短期摘要和长期记忆回答；"
+            "证据不足时要明确说明。直接输出面向用户的 Markdown 回答正文，不要输出 JSON。"
+        )
+    return (
+        "你是实验室研发知识库问答助手。只能基于给定上下文、短期摘要和长期记忆回答；"
+        "证据不足时要明确说明。直接输出面向用户的 Markdown 回答正文，不要输出 JSON。"
+    )

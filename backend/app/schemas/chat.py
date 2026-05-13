@@ -11,10 +11,15 @@ class ChatSessionCreate(BaseModel):
 class ChatMessageCreate(BaseModel):
     content: str = Field(min_length=1)
     context_type: Literal["general", "github_commit"] = "general"
+    action: Literal["auto", "answer", "review", "test", "review_and_test"] = "auto"
     repository_id: str | None = None
     commit_sha: str | None = None
+    pr_number: int | None = None
     intent: Literal["auto", "explain", "compliance", "review"] = "auto"
     persist_review: bool = True
+    persist_results: bool = True
+    language: str | None = None
+    framework: str | None = None
 
     @model_validator(mode="after")
     def validate_context(self) -> "ChatMessageCreate":

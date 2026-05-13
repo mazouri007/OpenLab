@@ -6,6 +6,7 @@ import {
   Checkbox,
   Form,
   Input,
+  InputNumber,
   List,
   Modal,
   Select,
@@ -21,7 +22,8 @@ import {
   listRepositories,
   listChatMessages,
   listChatSessions,
-  sendChatMessage,
+  streamChatMessage,
+  type ChatStreamStatus,
   type ChatMessagePayload,
 } from "../api/platform";
 import { CitationList } from "../components/CitationList";
@@ -31,9 +33,12 @@ import { useCurrentProject } from "../hooks/useCurrentProject";
 import type { ChatAnswer, ChatMessage, ChatSession } from "../types/domain";
 
 type LocalExchange = {
+  id: string;
   sessionId: string;
   question: string;
   answer: ChatAnswer;
+  status?: string;
+  isStreaming: boolean;
 };
 
 type DisplayMessage = Pick<ChatMessage, "id" | "role" | "content" | "citations_json">;
@@ -43,6 +48,7 @@ type CreateSessionForm = {
 };
 
 type CommitIntent = "auto" | "explain" | "compliance" | "review";
+type ChatAction = "auto" | "answer" | "review" | "test" | "review_and_test";
 
 export default function ChatPage() {
   const { projectId } = useCurrentProject();
@@ -56,8 +62,13 @@ export default function ChatPage() {
   const [commitEnabled, setCommitEnabled] = useState(false);
   const [commitRepositoryId, setCommitRepositoryId] = useState<string>();
   const [commitSha, setCommitSha] = useState("");
+  const [prNumber, setPrNumber] = useState<number | null>(null);
   const [commitIntent, setCommitIntent] = useState<CommitIntent>("auto");
+  const [chatAction, setChatAction] = useState<ChatAction>("auto");
+  const [language, setLanguage] = useState<string>();
+  const [framework, setFramework] = useState<string>();
   const [persistReview, setPersistReview] = useState(true);
+  const [isStreaming, setIsStreaming] = useState(false);
 
   const sessionsQuery = useQuery({
     queryKey: ["chat-sessions", projectId],
@@ -106,21 +117,6 @@ export default function ChatPage() {
     },
   });
 
-  const sendMutation = useMutation({
-    mutationFn: (payload: ChatMessagePayload) => sendChatMessage(selectedSession!.id, payload),
-    onSuccess: async (answer, payload) => {
-      if (selectedSession) {
-        setLastExchange({ sessionId: selectedSession.id, question: payload.content, answer });
-      }
-      setInput("");
-      await queryClient.invalidateQueries({ queryKey: ["chat-messages", selectedSession?.id] });
-      await queryClient.invalidateQueries({ queryKey: ["chat-sessions", projectId] });
-    },
-    onError: (error: Error) => {
-      message.error(`发送失败：${error.message}`);
-    },
-  });
-
   const displayedMessages = useMemo<DisplayMessage[]>(() => {
     const serverMessages = messagesQuery.data ?? [];
     const merged: DisplayMessage[] = [...serverMessages];
@@ -137,7 +133,7 @@ export default function ChatPage() {
 
     if (!hasQuestion) {
       merged.push({
-        id: `local-user-${lastExchange.sessionId}`,
+        id: `local-user-${lastExchange.id}`,
         role: "user",
         content: lastExchange.question,
         citations_json: [],
@@ -145,9 +141,9 @@ export default function ChatPage() {
     }
     if (!hasAnswer) {
       merged.push({
-        id: `local-assistant-${lastExchange.sessionId}`,
+        id: `local-assistant-${lastExchange.id}`,
         role: "assistant",
-        content: lastExchange.answer.answer,
+        content: lastExchange.answer.answer || lastExchange.status || "正在生成回答...",
         citations_json: lastExchange.answer.citations,
       });
     }
@@ -157,26 +153,101 @@ export default function ChatPage() {
   const lastAnswer =
     lastExchange && lastExchange.sessionId === selectedSession?.id ? lastExchange.answer : null;
 
-  const submitQuestion = () => {
+  const submitQuestion = async () => {
     const content = input.trim();
-    if (!selectedSession || !content) {
+    if (!selectedSession || !content || isStreaming) {
       return;
     }
-    if (commitEnabled && (!commitRepositoryId || !commitSha.trim())) {
-      message.warning("请选择仓库并填写 commit SHA。");
+    if (commitEnabled && (!commitRepositoryId || (!commitSha.trim() && !prNumber))) {
+      message.warning("请选择仓库，并填写 commit SHA 或 PR 编号。");
       return;
     }
     const payload: ChatMessagePayload = commitEnabled
       ? {
           content,
-          context_type: "github_commit",
+          context_type: commitSha.trim() ? "github_commit" : "general",
+          action: chatAction,
           repository_id: commitRepositoryId,
-          commit_sha: commitSha.trim(),
+          commit_sha: commitSha.trim() || undefined,
+          pr_number: prNumber || undefined,
           intent: commitIntent,
           persist_review: persistReview,
+          persist_results: persistReview,
+          language,
+          framework: framework?.trim() || undefined,
         }
-      : { content };
-    sendMutation.mutate(payload);
+      : { content, action: chatAction };
+    const sessionId = selectedSession.id;
+    const exchangeId = `${sessionId}-${Date.now()}`;
+    const emptyAnswer: ChatAnswer = {
+      answer: "",
+      citations: [],
+      used_memory: [],
+      used_documents: [],
+      rewritten_queries: [],
+      reasoning_summary: "",
+      confidence: 0,
+      metadata: {},
+    };
+    setLastExchange({
+      id: exchangeId,
+      sessionId,
+      question: content,
+      answer: emptyAnswer,
+      status: "正在准备回答...",
+      isStreaming: true,
+    });
+    setInput("");
+    setIsStreaming(true);
+    const updateExchange = (updater: (current: LocalExchange) => LocalExchange) => {
+      setLastExchange((current) => {
+        if (!current || current.id !== exchangeId) {
+          return current;
+        }
+        return updater(current);
+      });
+    };
+    try {
+      await streamChatMessage(sessionId, payload, {
+        onStatus: (status: ChatStreamStatus) => {
+          updateExchange((current) => ({ ...current, status: status.message }));
+        },
+        onDelta: (delta) => {
+          updateExchange((current) => ({
+            ...current,
+            answer: { ...current.answer, answer: current.answer.answer + delta },
+          }));
+        },
+        onDone: ({ answer }) => {
+          updateExchange((current) => ({
+            ...current,
+            answer,
+            status: undefined,
+            isStreaming: false,
+          }));
+        },
+        onError: (detail) => {
+          updateExchange((current) => ({
+            ...current,
+            status: detail,
+            isStreaming: false,
+          }));
+          message.error(`发送失败：${detail}`);
+        },
+      });
+      await queryClient.invalidateQueries({ queryKey: ["chat-messages", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-sessions", projectId] });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "未知错误";
+      updateExchange((current) => ({
+        ...current,
+        status: detail,
+        isStreaming: false,
+      }));
+      message.error(`发送失败：${detail}`);
+    } finally {
+      setIsStreaming(false);
+    }
   };
 
   const submitCreateSession = async () => {
@@ -187,7 +258,7 @@ export default function ChatPage() {
   const canSubmit =
     !!selectedSession &&
     !!input.trim() &&
-    (!commitEnabled || (!!commitRepositoryId && !!commitSha.trim()));
+    (!commitEnabled || (!!commitRepositoryId && (!!commitSha.trim() || !!prNumber)));
 
   return (
     <div className="page-grid">
@@ -252,14 +323,6 @@ export default function ChatPage() {
                 <MessageContent content={chatMessage.content} />
               </div>
             ))}
-            {sendMutation.isPending ? (
-              <div className="message-item assistant">
-                <Typography.Text strong>AI 助手</Typography.Text>
-                <Typography.Paragraph type="secondary" style={{ marginBottom: 0, marginTop: 6 }}>
-                  正在检索知识库并调用模型生成回答...
-                </Typography.Paragraph>
-              </div>
-            ) : null}
           </div>
           <Input.TextArea
             value={input}
@@ -274,12 +337,26 @@ export default function ChatPage() {
               }
             }}
           />
+          <Space wrap size="middle" style={{ marginTop: 12 }}>
+            <Select<ChatAction>
+              style={{ width: 170 }}
+              value={chatAction}
+              onChange={setChatAction}
+              options={[
+                { value: "auto", label: "自动识别动作" },
+                { value: "answer", label: "只回答" },
+                { value: "review", label: "代码审查" },
+                { value: "test", label: "生成测试" },
+                { value: "review_and_test", label: "审查并测试" },
+              ]}
+            />
+          </Space>
           <div className="commit-context-panel">
             <Checkbox
               checked={commitEnabled}
               onChange={(event) => setCommitEnabled(event.target.checked)}
             >
-              关联 GitHub Commit
+              精确指定 GitHub 上下文
             </Checkbox>
             {commitEnabled ? (
               <Space wrap size="middle" style={{ marginTop: 12 }}>
@@ -299,6 +376,14 @@ export default function ChatPage() {
                   value={commitSha}
                   onChange={(event) => setCommitSha(event.target.value)}
                 />
+                <InputNumber
+                  style={{ width: 130 }}
+                  min={1}
+                  precision={0}
+                  placeholder="PR 编号"
+                  value={prNumber}
+                  onChange={setPrNumber}
+                />
                 <Select<CommitIntent>
                   style={{ width: 150 }}
                   value={commitIntent}
@@ -310,12 +395,28 @@ export default function ChatPage() {
                     { value: "review", label: "代码审查" },
                   ]}
                 />
+                <Select
+                  allowClear
+                  style={{ width: 140 }}
+                  placeholder="语言"
+                  value={language}
+                  onChange={setLanguage}
+                  options={[
+                    { value: "python", label: "Python" },
+                    { value: "java", label: "Java" },
+                  ]}
+                />
+                <Input
+                  style={{ width: 160 }}
+                  placeholder="测试框架"
+                  value={framework}
+                  onChange={(event) => setFramework(event.target.value)}
+                />
                 <Checkbox
                   checked={persistReview}
-                  disabled={!["auto", "compliance", "review"].includes(commitIntent)}
                   onChange={(event) => setPersistReview(event.target.checked)}
                 >
-                  保存审查任务
+                  保存任务结果
                 </Checkbox>
               </Space>
             ) : null}
@@ -324,7 +425,7 @@ export default function ChatPage() {
             type="primary"
             style={{ marginTop: 12 }}
             disabled={!canSubmit}
-            loading={sendMutation.isPending}
+            loading={isStreaming}
             onClick={submitQuestion}
           >
             发送问题
@@ -352,6 +453,12 @@ export default function ChatPage() {
               <Typography.Paragraph>
                 <strong>审查任务：</strong>
                 {String(lastAnswer.metadata.review_task_id)}
+              </Typography.Paragraph>
+            ) : null}
+            {lastAnswer?.metadata?.test_generation_task_id ? (
+              <Typography.Paragraph>
+                <strong>测试任务：</strong>
+                {String(lastAnswer.metadata.test_generation_task_id)}
               </Typography.Paragraph>
             ) : null}
             <Typography.Text type="secondary">

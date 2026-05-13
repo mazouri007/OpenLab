@@ -1,10 +1,9 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
-from app.db.base import Base
 
 settings = get_settings()
 engine = create_engine(settings.database_url, future=True, echo=False)
@@ -23,8 +22,10 @@ def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.models import Project, User
 
-    Base.metadata.create_all(bind=engine)
-    _ensure_schema_compatibility()
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
     with SessionLocal() as db:
         user = db.query(User).filter(User.email == "demo@example.com").first()
         if user is None:
@@ -42,22 +43,3 @@ def init_db() -> None:
             )
             db.add(project)
         db.commit()
-
-
-def _ensure_schema_compatibility() -> None:
-    if engine.dialect.name != "sqlite":
-        return
-    inspector = inspect(engine)
-    if "knowledge_documents" not in inspector.get_table_names():
-        return
-    columns = {column["name"] for column in inspector.get_columns("knowledge_documents")}
-    statements = []
-    if "error_message" not in columns:
-        statements.append("ALTER TABLE knowledge_documents ADD COLUMN error_message TEXT")
-    if "metadata_json" not in columns:
-        statements.append("ALTER TABLE knowledge_documents ADD COLUMN metadata_json JSON DEFAULT '{}'")
-    if not statements:
-        return
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))

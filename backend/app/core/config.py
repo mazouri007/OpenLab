@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     api_v1_prefix: str = "/api/v1"
     app_env: Literal["dev", "test", "prod"] = "dev"
+    app_secret_keys: str = ""
     cors_allow_origins: list[str] = [
         "http://127.0.0.1:5173",
         "http://localhost:5173",
@@ -28,13 +29,20 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://localhost:6379/2"
     celery_task_always_eager: bool = True
 
-    llm_provider: str = "litellm"
+    llm_provider: str = "langchain"
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_chat_model: str = "gpt-4o-mini"
     llm_embedding_model: str = "text-embedding-3-small"
+    llm_embedding_provider_type: str | None = None
+    llm_embedding_base_url: str | None = None
+    llm_embedding_api_key: str | None = None
     llm_timeout_seconds: int = 60
     llm_use_env_proxy: bool = False
+
+    chroma_persist_directory: str = "./chroma_db"
+    chroma_collection_name: str = "openlab_knowledge_chunks"
+    rag_vector_top_k: int = 12
 
     github_webhook_secret: str = "dev-secret"
     enable_mock_llm: bool = Field(default=True)
