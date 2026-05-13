@@ -107,6 +107,12 @@ export type ModelProvider = {
   base_url?: string | null;
   default_chat_model: string;
   default_embedding_model: string;
+  embedding_provider_type?: string | null;
+  embedding_base_url?: string | null;
+  has_api_key: boolean;
+  has_embedding_api_key: boolean;
+  api_key_masked?: string | null;
+  embedding_api_key_masked?: string | null;
   is_default: boolean;
 };
 

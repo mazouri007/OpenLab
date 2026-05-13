@@ -5,14 +5,14 @@ from sqlalchemy.orm import Session
 
 from app.agents.prompt_catalog import MEMORY_EXTRACTION_PROMPT
 from app.models import ChatMessage, ChatSession, LongTermMemory, MemorySummary
-from app.services.llm.litellm_provider import LiteLLMProvider
+from app.services.llm.langchain_provider import LangChainLLMProvider
 from app.services.llm.provider_resolver import resolve_model_config
 
 
 class MemoryService:
     def __init__(self, db: Session) -> None:
         self.db = db
-        self.llm_provider = LiteLLMProvider()
+        self.llm_provider = LangChainLLMProvider()
 
     def create_session(self, project_id: str, user_id: str, title: str) -> ChatSession:
         session = ChatSession(project_id=project_id, user_id=user_id, title=title)

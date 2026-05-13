@@ -37,6 +37,27 @@ class GitHubMCPClient:
             arguments["ref"] = ref
         return self._call_tool("get_file_contents", arguments)
 
+    def get_pull_request_diff(self, repo_full_name: str, pr_number: int) -> dict[str, Any]:
+        owner, repo = _split_repo_full_name(repo_full_name)
+        pr_payload = self._call_tool(
+            "get_pull_request",
+            {"owner": owner, "repo": repo, "pullNumber": pr_number},
+        )
+        try:
+            files_payload = self._call_tool(
+                "get_pull_request_files",
+                {"owner": owner, "repo": repo, "pullNumber": pr_number},
+            )
+        except GitHubMCPError:
+            files_payload = {}
+        files = files_payload.get("files") or files_payload.get("data") or pr_payload.get("files") or []
+        return {
+            "repo_full_name": repo_full_name,
+            "pr_number": pr_number,
+            "title": pr_payload.get("title") or pr_payload.get("raw_text") or f"PR #{pr_number}",
+            "files": files,
+        }
+
     def _call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not self.settings.mcp_github_enabled:
             raise GitHubMCPError("GitHub MCP is disabled by MCP_GITHUB_ENABLED=false.")

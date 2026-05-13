@@ -11,7 +11,7 @@ from app.agents.output_models import TestCodeOutput, TestPlanOutput
 from app.agents.prompt_catalog import TEST_CODE_SYSTEM_PROMPT, TEST_PLAN_SYSTEM_PROMPT
 from app.models import TestGenerationTask
 from app.services.llm.exceptions import LLMOutputParseError
-from app.services.llm.litellm_provider import LiteLLMProvider
+from app.services.llm.langchain_provider import LangChainLLMProvider
 
 
 class TestGenGraphState(TypedDict, total=False):
@@ -29,7 +29,7 @@ class TestGenGraphState(TypedDict, total=False):
 def run_testgen_graph(
     db: Session, task: TestGenerationTask, model_config: dict[str, Any]
 ) -> TestGenGraphState:
-    llm_provider = LiteLLMProvider()
+    llm_provider = LangChainLLMProvider()
 
     def load_task_context(_: TestGenGraphState) -> TestGenGraphState:
         task.status = "running"

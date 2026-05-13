@@ -147,6 +147,7 @@ def test_index_document_stores_chunk_identity_hash_and_indexed_content() -> None
 
     with session_factory() as db:
         service = RagService(db)
+        service.llm_provider.settings.enable_mock_llm = True
         document = service.create_document(
             "project-1",
             KnowledgeDocumentCreate(
@@ -158,7 +159,11 @@ def test_index_document_stores_chunk_identity_hash_and_indexed_content() -> None
         service.index_document(document)
 
         chunk = db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id == document.id).one()
+        chunk_id = chunk.id
         metadata = chunk.metadata_json
+        refreshed_document = db.get(type(document), document.id)
+        vector_indexed = refreshed_document.metadata_json["vector_indexed"]
+        hits = service.vector_store.query("project-1", [1.0, 0.1, 0.2, 0.3])
 
     assert metadata["chunk_id"] == f"{document.id}_0001"
     assert metadata["doc_id"] == document.id
@@ -166,4 +171,34 @@ def test_index_document_stores_chunk_identity_hash_and_indexed_content() -> None
     assert len(metadata["content_hash"]) == 32
     assert metadata["chunk_type"] == "manual"
     assert "标题路径：混合检索 > BM25" in metadata["indexed_content"]
-    assert "embedding" in metadata
+    assert "embedding" not in metadata
+    assert vector_indexed is True
+    assert hits and hits[0].chunk_id == chunk_id
+
+
+def test_index_document_keeps_keyword_chunks_when_vector_store_unavailable() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    with session_factory() as db:
+        service = RagService(db)
+        service.vector_store = None
+        service.llm_provider.settings.enable_mock_llm = True
+        document = service.create_document(
+            "project-1",
+            KnowledgeDocumentCreate(
+                title="Fallback",
+                source_name="manual",
+                raw_text="# 规范\n\n关键词检索仍应可用。",
+            ),
+        )
+        service.index_document(document)
+
+        chunks = db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id == document.id).all()
+        refreshed_document = db.get(type(document), document.id)
+
+    assert chunks
+    assert refreshed_document.parse_status == "indexed"
+    assert refreshed_document.metadata_json["vector_indexed"] is False
+    assert "关键词索引" in refreshed_document.error_message

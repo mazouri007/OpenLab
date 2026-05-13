@@ -138,7 +138,7 @@ def _select_repository(
         return matched[0]
     if len(matched) > 1:
         return None
-    if commit_sha and len(repositories) == 1:
+    if (commit_sha or len(repositories) == 1) and len(repositories) == 1:
         return repositories[0]
     return None
 

@@ -23,6 +23,8 @@ from app.services.commit_context.service import (
     CommitContextService,
     CommitFileChange,
 )
+from app.services.code_context.models import CodeChangeContext, CodeChangedFile
+from app.services.code_context.resolver import PullRequestContextService
 from app.services.mcp.github_client import GitHubMCPError
 
 
@@ -168,7 +170,8 @@ def test_chat_graph_commit_explain_returns_metadata_and_citations(
     answer = state["rag_answer"]
     assert answer.metadata["repo_full_name"] == "lab/demo-platform"
     assert answer.metadata["commit_sha"] == "abc123"
-    assert answer.metadata["intent"] == "explain"
+    assert answer.metadata["detected_action"] == "answer"
+    assert answer.metadata["context_kind"] == "github_commit"
     assert any(item["source_type"] == "github_commit" for item in answer.citations)
     assert db_session.query(ChatMessage).filter(ChatMessage.session_id == "session-1").count() == 2
 
@@ -195,11 +198,11 @@ def test_chat_graph_commit_review_persists_review_task(
 
     answer = state["rag_answer"]
     assert "review_task_id" in answer.metadata
-    assert "审查结论" in answer.answer
+    assert "代码审查" in answer.answer
     task = db_session.get(CodeReviewTask, answer.metadata["review_task_id"])
     assert task is not None
     assert task.status == "completed"
-    assert task.source_type == "github_commit"
+    assert task.source_type == "manual_diff"
 
 
 def test_chat_graph_auto_detects_commit_sha_with_single_repo(
@@ -212,10 +215,10 @@ def test_chat_graph_auto_detects_commit_sha_with_single_repo(
     state = run_chat_graph(db_session, session, "abc1234 这个提交增加了什么功能？")
 
     answer = state["rag_answer"]
-    assert answer.metadata["context_type"] == "github_commit"
+    assert answer.metadata["context_kind"] == "github_commit"
     assert answer.metadata["repo_full_name"] == "lab/demo-platform"
     assert answer.metadata["commit_sha"] == "abc1234"
-    assert answer.metadata["intent"] == "explain"
+    assert answer.metadata["detected_action"] == "answer"
     assert any(item["source_type"] == "github_commit" for item in answer.citations)
 
 
@@ -227,22 +230,96 @@ def test_chat_graph_auto_clarifies_missing_commit_sha(db_session: Session) -> No
 
     answer = state["rag_answer"]
     assert answer.metadata["needs_clarification"] is True
-    assert "commit SHA" in answer.metadata["missing_fields"]
-    assert "请补充" in answer.answer
+    assert "PR 编号、commit SHA 或 diff 内容" in answer.metadata["missing_fields"]
+    assert "可以补充" in answer.answer
     assert db_session.query(ChatMessage).filter(ChatMessage.session_id == "session-1").count() == 2
 
 
-def test_chat_graph_auto_clarifies_pr_number_without_commit_sha(db_session: Session) -> None:
+def test_chat_graph_executes_pr_review(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(PullRequestContextService, "load_pr_context", _fake_load_pr_context)
     session = db_session.get(ChatSession, "session-1")
     assert session is not None
 
     state = run_chat_graph(db_session, session, "请看一下 PR #42 的风险")
 
     answer = state["rag_answer"]
-    assert answer.metadata["needs_clarification"] is True
+    assert answer.metadata["detected_action"] == "review"
     assert answer.metadata["pr_number"] == 42
-    assert "commit SHA" in answer.metadata["missing_fields"]
-    assert "PR #42" in answer.answer
+    assert "review_task_id" in answer.metadata
+    assert "代码审查" in answer.answer
+
+
+def test_chat_graph_generates_tests_for_manual_diff(db_session: Session) -> None:
+    session = db_session.get(ChatSession, "session-1")
+    assert session is not None
+
+    state = run_chat_graph(
+        db_session,
+        session,
+        "请给这个 diff 生成 pytest 测试\n```diff\n"
+        "diff --git a/app/service.py b/app/service.py\n"
+        "@@ -1 +1 @@\n"
+        "-def add(a,b): return a+b\n"
+        "+def add(a, b): return a + b\n"
+        "```",
+    )
+
+    answer = state["rag_answer"]
+    assert answer.metadata["detected_action"] == "test"
+    assert answer.metadata["context_kind"] == "manual_diff"
+    assert "test_generation_task_id" in answer.metadata
+    assert "测试生成" in answer.answer
+
+
+def test_chat_graph_review_and_test_for_manual_diff(db_session: Session) -> None:
+    session = db_session.get(ChatSession, "session-1")
+    assert session is not None
+
+    state = run_chat_graph(
+        db_session,
+        session,
+        "帮我审查并补测试\n```diff\n"
+        "diff --git a/app/service.py b/app/service.py\n"
+        "@@ -1 +1 @@\n"
+        "-def add(a,b): return a+b\n"
+        "+def add(a, b): return a + b\n"
+        "```",
+    )
+
+    answer = state["rag_answer"]
+    assert answer.metadata["detected_action"] == "review_and_test"
+    assert "review_task_id" in answer.metadata
+    assert "test_generation_task_id" in answer.metadata
+    assert "代码审查" in answer.answer
+    assert "测试生成" in answer.answer
+
+
+def test_chat_graph_testgen_reports_unsupported_language(db_session: Session) -> None:
+    session = db_session.get(ChatSession, "session-1")
+    assert session is not None
+
+    state = run_chat_graph(
+        db_session,
+        session,
+        ChatMessageCreate(
+            content=(
+                "请生成测试\n```diff\n"
+                "diff --git a/app/service.py b/app/service.py\n"
+                "@@ -1 +1 @@\n"
+                "+def add(a, b): return a + b\n"
+                "```"
+            ),
+            action="test",
+            language="javascript",
+        ),
+    )
+
+    answer = state["rag_answer"]
+    assert answer.metadata["unsupported_reason"] == "unsupported_language"
+    assert answer.metadata["test_generation_task_id"] is None
+    assert "当前只支持" in answer.answer
 
 
 def _seed_project_repo(db: Session) -> None:
@@ -297,6 +374,29 @@ def _fake_load_commit_context(
                 additions=10,
                 deletions=1,
                 changes=11,
+            )
+        ],
+    )
+
+
+def _fake_load_pr_context(
+    self: PullRequestContextService, project_id: str, repository_id: str, pr_number: int
+) -> CodeChangeContext:
+    return CodeChangeContext(
+        kind="github_pr",
+        title=f"lab/demo-platform PR #{pr_number}",
+        repository_id=repository_id,
+        repo_full_name="lab/demo-platform",
+        pr_number=pr_number,
+        summary="Mock PR",
+        source_provider="test",
+        files=[
+            CodeChangedFile(
+                path="app/service.py",
+                status="modified",
+                patch="@@ -1 +1 @@\n+def add(a, b): return a + b",
+                additions=1,
+                deletions=1,
             )
         ],
     )

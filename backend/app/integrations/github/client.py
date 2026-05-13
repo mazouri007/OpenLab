@@ -36,7 +36,16 @@ class GithubClient:
         pr = repo.get_pull(pr_number)
         files = []
         for file in pr.get_files():
-            files.append({"path": file.filename, "patch": file.patch or "", "status": file.status})
+            files.append(
+                {
+                    "path": file.filename,
+                    "patch": file.patch or "",
+                    "status": file.status,
+                    "additions": file.additions,
+                    "deletions": file.deletions,
+                    "changes": file.changes,
+                }
+            )
         return {
             "repo_full_name": repo_full_name,
             "pr_number": pr.number,

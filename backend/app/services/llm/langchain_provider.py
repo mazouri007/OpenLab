@@ -6,8 +6,8 @@ from contextlib import contextmanager, nullcontext
 from typing import Any
 from unittest.mock import patch
 
-import httpx
-from litellm import completion, embedding
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from app.core.config import get_settings
 from app.services.llm.base import LLMProvider
@@ -19,7 +19,7 @@ from app.services.llm.exceptions import (
 from app.utils.json_output import extract_json_object
 
 
-class LiteLLMProvider(LLMProvider):
+class LangChainLLMProvider(LLMProvider):
     def __init__(self) -> None:
         self.settings = get_settings()
 
@@ -30,7 +30,7 @@ class LiteLLMProvider(LLMProvider):
         schema_name: str,
         model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if self.settings.enable_mock_llm and not self._has_real_provider(model_config):
+        if self.settings.enable_mock_llm and not self._has_real_provider(model_config, "chat"):
             return self._mock_json(schema_name=schema_name, user_prompt=user_prompt)
 
         json_system_prompt = (
@@ -67,118 +67,120 @@ class LiteLLMProvider(LLMProvider):
         model_config: dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> str:
-        if self.settings.enable_mock_llm and not self._has_real_provider(model_config):
+        if self.settings.enable_mock_llm and not self._has_real_provider(model_config, "chat"):
             return (
                 '{"answer":"mock response","reasoning_summary":"mock reasoning",'
                 '"citations":[],"confidence":0.42}'
             )
-        config = self._require_config(model_config)
-        litellm_error: Exception | None = None
+        config = self._require_config(model_config, "chat")
         try:
             with self._network_environment():
-                response = completion(
-                    model=config["chat_model"],
-                    api_key=config.get("api_key"),
-                    base_url=config.get("base_url"),
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format=response_format,
-                    timeout=self.settings.llm_timeout_seconds,
-                )
-            return response["choices"][0]["message"]["content"]
+                model = self._chat_model(config)
+                kwargs = {"response_format": response_format} if response_format else {}
+                response = model.invoke(self._messages(system_prompt, user_prompt), **kwargs)
+            return _content_to_text(response.content)
         except Exception as exc:  # noqa: BLE001
-            litellm_error = exc
+            raise LLMInvocationError(f"LangChain chat completion failed: {exc}") from exc
 
-        if config.get("provider_type") == "openai-compatible":
-            try:
-                return self._chat_text_openai_compatible(
-                    system_prompt, user_prompt, config, response_format=response_format
-                )
-            except Exception as exc:  # noqa: BLE001
-                raise LLMInvocationError(
-                    "LiteLLM completion failed, and direct OpenAI-Compatible fallback "
-                    f"also failed. LiteLLM error: {litellm_error}. Direct error: {exc}"
-                ) from exc
+    def chat_text_stream(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model_config: dict[str, Any] | None = None,
+    ) -> Iterator[str]:
+        if self.settings.enable_mock_llm and not self._has_real_provider(model_config, "chat"):
+            content = "mock response"
+            for index in range(0, len(content), 8):
+                yield content[index : index + 8]
+            return
 
-        raise LLMInvocationError(f"LiteLLM completion failed: {litellm_error}") from litellm_error
+        config = self._require_config(model_config, "chat")
+        try:
+            with self._network_environment():
+                model = self._chat_model(config)
+                for chunk in model.stream(self._messages(system_prompt, user_prompt)):
+                    content = _content_to_text(chunk.content)
+                    if content:
+                        yield content
+        except Exception as exc:  # noqa: BLE001
+            raise LLMInvocationError(f"LangChain streaming chat completion failed: {exc}") from exc
 
     def embed_texts(
         self, texts: list[str], model_config: dict[str, Any] | None = None
     ) -> list[list[float]]:
-        if self.settings.enable_mock_llm and not self._has_real_provider(model_config):
+        if not texts:
+            return []
+        if self.settings.enable_mock_llm and not self._has_real_provider(model_config, "embedding"):
             return [[float((len(text) % 11) + 1), 0.1, 0.2, 0.3] for text in texts]
-        config = self._require_config(model_config)
-        litellm_error: Exception | None = None
+        config = self._require_config(model_config, "embedding")
         try:
             with self._network_environment():
-                response = embedding(
-                    model=config["embedding_model"],
-                    input=texts,
-                    api_key=config.get("api_key"),
+                embeddings = OpenAIEmbeddings(
+                    model=config["model"],
+                    api_key=config.get("api_key") or "unused",
                     base_url=config.get("base_url"),
                     timeout=self.settings.llm_timeout_seconds,
+                    check_embedding_ctx_length=False,
                 )
-            return [item["embedding"] for item in response["data"]]
+                return embeddings.embed_documents(texts)
         except Exception as exc:  # noqa: BLE001
-            litellm_error = exc
+            raise LLMInvocationError(f"LangChain embedding failed: {exc}") from exc
 
-        if config.get("provider_type") == "openai-compatible":
-            try:
-                return self._embed_texts_openai_compatible(texts, config)
-            except Exception as exc:  # noqa: BLE001
-                raise LLMInvocationError(
-                    "LiteLLM embedding failed, and direct OpenAI-Compatible fallback "
-                    f"also failed. LiteLLM error: {litellm_error}. Direct error: {exc}"
-                ) from exc
-
-        raise LLMInvocationError(f"LiteLLM embedding failed: {litellm_error}") from litellm_error
-
-    def _require_config(self, model_config: dict[str, Any] | None) -> dict[str, Any]:
-        if model_config is None:
-            raise LLMConfigurationError("Model configuration is required.")
-        if not model_config.get("chat_model"):
-            raise LLMConfigurationError("chat_model is missing in model config.")
-        return model_config
+    def _chat_model(self, config: dict[str, Any]) -> ChatOpenAI:
+        return ChatOpenAI(
+            model=config["model"],
+            api_key=config.get("api_key") or "unused",
+            base_url=config.get("base_url"),
+            timeout=self.settings.llm_timeout_seconds,
+            temperature=0,
+        )
 
     @staticmethod
-    def _has_real_provider(model_config: dict[str, Any] | None) -> bool:
-        return bool(
-            model_config
-            and model_config.get("chat_model")
-            and (model_config.get("api_key") or model_config.get("base_url"))
-        )
+    def _messages(system_prompt: str, user_prompt: str) -> list[SystemMessage | HumanMessage]:
+        return [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+
+    def _require_config(self, model_config: dict[str, Any] | None, kind: str) -> dict[str, Any]:
+        config = self._select_config(model_config, kind)
+        if config is None:
+            raise LLMConfigurationError(f"{kind} model configuration is required.")
+        if not config.get("model"):
+            raise LLMConfigurationError(f"{kind} model is missing in model config.")
+        if not (config.get("api_key") or config.get("base_url")):
+            raise LLMConfigurationError(f"{kind} api_key or base_url is missing in model config.")
+        return config
+
+    @staticmethod
+    def _select_config(model_config: dict[str, Any] | None, kind: str) -> dict[str, Any] | None:
+        if model_config is None:
+            return None
+        nested = model_config.get(kind)
+        if isinstance(nested, dict):
+            return nested
+
+        if kind == "chat" and model_config.get("chat_model"):
+            return {
+                "provider_type": model_config.get("provider_type", "openai-compatible"),
+                "base_url": model_config.get("base_url"),
+                "api_key": model_config.get("api_key"),
+                "model": model_config.get("chat_model"),
+            }
+        if kind == "embedding" and model_config.get("embedding_model"):
+            return {
+                "provider_type": model_config.get("provider_type", "openai-compatible"),
+                "base_url": model_config.get("base_url"),
+                "api_key": model_config.get("api_key"),
+                "model": model_config.get("embedding_model"),
+            }
+        return None
+
+    def _has_real_provider(self, model_config: dict[str, Any] | None, kind: str) -> bool:
+        config = self._select_config(model_config, kind)
+        return bool(config and config.get("model") and (config.get("api_key") or config.get("base_url")))
 
     def _network_environment(self):
         if self.settings.llm_use_env_proxy:
             return nullcontext()
         return _without_proxy_environment()
-
-    def _chat_text_openai_compatible(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        config: dict[str, Any],
-        response_format: dict[str, Any] | None = None,
-    ) -> str:
-        payload: dict[str, Any] = {
-            "model": _strip_litellm_openai_prefix(config["chat_model"]),
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        if response_format is not None:
-            payload["response_format"] = response_format
-        response = _post_openai_compatible(
-            base_url=config.get("base_url"),
-            api_key=config.get("api_key"),
-            endpoint="chat/completions",
-            payload=payload,
-            timeout=self.settings.llm_timeout_seconds,
-        )
-        return response["choices"][0]["message"]["content"]
 
     def _repair_json_output(
         self,
@@ -199,21 +201,6 @@ class LiteLLMProvider(LLMProvider):
             model_config=model_config,
             response_format={"type": "json_object"},
         )
-
-    def _embed_texts_openai_compatible(
-        self, texts: list[str], config: dict[str, Any]
-    ) -> list[list[float]]:
-        response = _post_openai_compatible(
-            base_url=config.get("base_url"),
-            api_key=config.get("api_key"),
-            endpoint="embeddings",
-            payload={
-                "model": _strip_litellm_openai_prefix(config["embedding_model"]),
-                "input": texts,
-            },
-            timeout=self.settings.llm_timeout_seconds,
-        )
-        return [item["embedding"] for item in response["data"]]
 
     @staticmethod
     def _mock_json(schema_name: str, user_prompt: str) -> dict[str, Any]:
@@ -290,47 +277,17 @@ def _without_proxy_environment() -> Iterator[None]:
         yield
 
 
-def _strip_litellm_openai_prefix(model: str) -> str:
-    return model.removeprefix("openai/")
-
-
-def _post_openai_compatible(
-    base_url: str | None,
-    api_key: str | None,
-    endpoint: str,
-    payload: dict[str, Any],
-    timeout: int,
-) -> dict[str, Any]:
-    if not base_url:
-        raise LLMConfigurationError("base_url is missing in model config.")
-    if not api_key:
-        raise LLMConfigurationError("api_key is missing in model config.")
-
-    url = _build_openai_compatible_url(base_url, endpoint)
-    try:
-        with httpx.Client(timeout=timeout, trust_env=False) as client:
-            response = client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        body = exc.response.text[:500]
-        raise LLMInvocationError(
-            f"OpenAI-Compatible endpoint returned HTTP {exc.response.status_code}: {body}"
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise LLMInvocationError(f"OpenAI-Compatible connection failed: {exc}") from exc
-
-
-def _build_openai_compatible_url(base_url: str, endpoint: str) -> str:
-    normalized = base_url.strip().rstrip("/")
-    endpoint = endpoint.strip("/")
-    if normalized.endswith(f"/{endpoint}"):
-        return normalized
-    return f"{normalized}/{endpoint}"
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return "" if content is None else str(content)

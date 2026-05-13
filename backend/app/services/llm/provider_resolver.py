@@ -4,6 +4,7 @@ from urllib.parse import urlparse, urlunparse
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.secrets import decrypt_secret
 from app.models import ModelProvider
 from app.services.llm.exceptions import LLMConfigurationError
 
@@ -16,41 +17,59 @@ def resolve_model_config(db: Session, project_id: str) -> dict[str, Any]:
         .first()
     )
     if provider:
+        embedding_provider_type = provider.embedding_provider_type or provider.provider_type
+        embedding_base_url = provider.embedding_base_url or provider.base_url
+        embedding_api_key = provider.embedding_api_key or provider.api_key
+        chat_api_key = decrypt_secret(provider.api_key)
+        resolved_embedding_api_key = decrypt_secret(embedding_api_key)
         return {
             "provider_id": provider.id,
-            "provider_type": provider.provider_type,
             "provider_name": provider.name,
-            "base_url": normalize_base_url(provider.provider_type, provider.base_url),
-            "api_key": provider.api_key,
-            "chat_model": _litellm_model_name(
-                provider.provider_type, provider.default_chat_model
-            ),
-            "embedding_model": _litellm_model_name(
-                provider.provider_type, provider.default_embedding_model
-            ),
+            "chat": {
+                "provider_type": provider.provider_type,
+                "base_url": normalize_base_url(provider.provider_type, provider.base_url),
+                "api_key": chat_api_key,
+                "model": normalize_model_name(provider.provider_type, provider.default_chat_model),
+            },
+            "embedding": {
+                "provider_type": embedding_provider_type,
+                "base_url": normalize_base_url(embedding_provider_type, embedding_base_url),
+                "api_key": resolved_embedding_api_key,
+                "model": normalize_model_name(
+                    embedding_provider_type, provider.default_embedding_model
+                ),
+            },
         }
 
     settings = get_settings()
     if settings.llm_api_key or settings.enable_mock_llm:
+        embedding_provider_type = settings.llm_embedding_provider_type or "openai-compatible"
+        embedding_base_url = settings.llm_embedding_base_url or settings.llm_base_url
+        embedding_api_key = settings.llm_embedding_api_key or settings.llm_api_key
         return {
             "provider_id": "env-default",
-            "provider_type": "openai-compatible",
             "provider_name": "Environment Default",
-            "base_url": normalize_base_url("openai-compatible", settings.llm_base_url),
-            "api_key": settings.llm_api_key,
-            "chat_model": _litellm_model_name("openai-compatible", settings.llm_chat_model),
-            "embedding_model": _litellm_model_name(
-                "openai-compatible", settings.llm_embedding_model
-            ),
+            "chat": {
+                "provider_type": "openai-compatible",
+                "base_url": normalize_base_url("openai-compatible", settings.llm_base_url),
+                "api_key": settings.llm_api_key,
+                "model": normalize_model_name("openai-compatible", settings.llm_chat_model),
+            },
+            "embedding": {
+                "provider_type": embedding_provider_type,
+                "base_url": normalize_base_url(embedding_provider_type, embedding_base_url),
+                "api_key": embedding_api_key,
+                "model": normalize_model_name(
+                    embedding_provider_type, settings.llm_embedding_model
+                ),
+            },
         }
     raise LLMConfigurationError("No model provider configured for this project.")
 
 
-def _litellm_model_name(provider_type: str, model_name: str) -> str:
-    if "/" in model_name:
-        return model_name
+def normalize_model_name(provider_type: str, model_name: str) -> str:
     if provider_type == "openai-compatible":
-        return f"openai/{model_name}"
+        return model_name.removeprefix("openai/")
     return model_name
 
 
@@ -74,14 +93,26 @@ def normalize_base_url(provider_type: str, base_url: str | None) -> str | None:
 
 def normalize_model_config(payload: dict[str, Any]) -> dict[str, Any]:
     provider_type = str(payload.get("provider_type") or "openai-compatible")
+    embedding_provider_type = str(payload.get("embedding_provider_type") or provider_type)
+    embedding_base_url = payload.get("embedding_base_url") or payload.get("base_url")
+    embedding_api_key = payload.get("embedding_api_key") or payload.get("api_key")
     return {
         "provider_id": payload.get("provider_id", "adhoc"),
-        "provider_type": provider_type,
         "provider_name": payload.get("provider_name", payload.get("name", "Adhoc Provider")),
-        "base_url": normalize_base_url(provider_type, payload.get("base_url")),
-        "api_key": payload.get("api_key"),
-        "chat_model": _litellm_model_name(provider_type, str(payload.get("default_chat_model") or "")),
-        "embedding_model": _litellm_model_name(
-            provider_type, str(payload.get("default_embedding_model") or "")
-        ),
+        "chat": {
+            "provider_type": provider_type,
+            "base_url": normalize_base_url(provider_type, payload.get("base_url")),
+            "api_key": payload.get("api_key"),
+            "model": normalize_model_name(
+                provider_type, str(payload.get("default_chat_model") or "")
+            ),
+        },
+        "embedding": {
+            "provider_type": embedding_provider_type,
+            "base_url": normalize_base_url(embedding_provider_type, embedding_base_url),
+            "api_key": embedding_api_key,
+            "model": normalize_model_name(
+                embedding_provider_type, str(payload.get("default_embedding_model") or "")
+            ),
+        },
     }
