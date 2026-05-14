@@ -28,7 +28,7 @@ export default function App() {
   const { projects, projectId, setProjectId, currentProject, isLoading } = useCurrentProject();
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
+    <Layout className="app-shell">
       <Layout.Sider width={248} theme="light" className="shell-sider">
         <div className="brand-block">
           <div className="brand-title">Lab AI Reviewer</div>
@@ -42,7 +42,7 @@ export default function App() {
           style={{ borderInlineEnd: "none" }}
         />
       </Layout.Sider>
-      <Layout>
+      <Layout className="shell-main">
         <Layout.Header className="app-header">
           <div>
             <Typography.Text strong>
@@ -70,7 +70,7 @@ export default function App() {
             </Space>
           </div>
         </Layout.Header>
-        <Layout.Content style={{ padding: 24 }}>
+        <Layout.Content className="app-content">
           <Outlet />
         </Layout.Content>
       </Layout>
