@@ -1,9 +1,16 @@
 import {
+  InfoCircleOutlined,
+  PlusOutlined,
+  SendOutlined,
+  UnorderedListOutlined,
+} from "@ant-design/icons";
+import {
   Alert,
   App as AntApp,
   Button,
   Card,
   Checkbox,
+  Drawer,
   Form,
   Input,
   InputNumber,
@@ -12,10 +19,11 @@ import {
   Select,
   Skeleton,
   Space,
+  Tooltip,
   Typography,
 } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createChatSession,
@@ -43,6 +51,15 @@ type LocalExchange = {
 
 type DisplayMessage = Pick<ChatMessage, "id" | "role" | "content" | "citations_json">;
 
+type AnswerContext = {
+  citations: ChatAnswer["citations"];
+  rewrittenQueries: string[];
+  usedMemory: string[];
+  reasoningSummary: string;
+  confidence: number | null;
+  metadata: Record<string, unknown>;
+};
+
 type CreateSessionForm = {
   title: string;
 };
@@ -50,13 +67,49 @@ type CreateSessionForm = {
 type CommitIntent = "auto" | "explain" | "compliance" | "review";
 type ChatAction = "auto" | "answer" | "review" | "test" | "review_and_test";
 
+function getMessageRoleClass(role: string) {
+  return role === "user" ? "user" : "assistant";
+}
+
+function getMessageLabel(role: string) {
+  if (role === "user") {
+    return "你";
+  }
+  if (role === "assistant") {
+    return "OpenLab";
+  }
+  return role;
+}
+
+function getMessageInitial(role: string) {
+  return role === "user" ? "你" : "AI";
+}
+
+function normalizeCitations(citations: Record<string, unknown>[]): ChatAnswer["citations"] {
+  return citations
+    .map((item) => ({
+      chunk_id: String(item.chunk_id ?? item.id ?? ""),
+      snippet: String(item.snippet ?? ""),
+      source_type: String(item.source_type ?? "knowledge"),
+      source_title:
+        typeof item.source_title === "string"
+          ? item.source_title
+          : typeof item.source === "string"
+            ? item.source
+            : null,
+    }))
+    .filter((item) => item.chunk_id || item.snippet || item.source_title);
+}
+
 export default function ChatPage() {
   const { projectId } = useCurrentProject();
   const { message } = AntApp.useApp();
   const queryClient = useQueryClient();
   const [form] = Form.useForm<CreateSessionForm>();
+  const messageScrollRef = useRef<HTMLDivElement | null>(null);
   const [input, setInput] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
   const [selectedSession, setSelectedSession] = useState<ChatSession | null>(null);
   const [lastExchange, setLastExchange] = useState<LocalExchange | null>(null);
   const [commitEnabled, setCommitEnabled] = useState(false);
@@ -69,6 +122,7 @@ export default function ChatPage() {
   const [framework, setFramework] = useState<string>();
   const [persistReview, setPersistReview] = useState(true);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [answerContext, setAnswerContext] = useState<AnswerContext | null>(null);
 
   const sessionsQuery = useQuery({
     queryKey: ["chat-sessions", projectId],
@@ -150,8 +204,45 @@ export default function ChatPage() {
     return merged;
   }, [lastExchange, messagesQuery.data, selectedSession?.id]);
 
-  const lastAnswer =
-    lastExchange && lastExchange.sessionId === selectedSession?.id ? lastExchange.answer : null;
+  useEffect(() => {
+    const scrollArea = messageScrollRef.current;
+    if (!scrollArea) {
+      return;
+    }
+    scrollArea.scrollTo({
+      top: scrollArea.scrollHeight,
+      behavior: isStreaming ? "smooth" : "auto",
+    });
+  }, [displayedMessages, isStreaming]);
+
+  const getLocalAnswerForMessage = (chatMessage: DisplayMessage) => {
+    if (
+      !lastExchange ||
+      lastExchange.sessionId !== selectedSession?.id ||
+      chatMessage.role !== "assistant"
+    ) {
+      return null;
+    }
+    if (
+      chatMessage.id === `local-assistant-${lastExchange.id}` ||
+      chatMessage.content === lastExchange.answer.answer
+    ) {
+      return lastExchange.answer;
+    }
+    return null;
+  };
+
+  const openAnswerContext = (chatMessage: DisplayMessage) => {
+    const localAnswer = getLocalAnswerForMessage(chatMessage);
+    setAnswerContext({
+      citations: localAnswer?.citations ?? normalizeCitations(chatMessage.citations_json),
+      rewrittenQueries: localAnswer?.rewritten_queries ?? [],
+      usedMemory: localAnswer?.used_memory ?? [],
+      reasoningSummary: localAnswer?.reasoning_summary ?? "",
+      confidence: typeof localAnswer?.confidence === "number" ? localAnswer.confidence : null,
+      metadata: localAnswer?.metadata ?? {},
+    });
+  };
 
   const submitQuestion = async () => {
     const content = input.trim();
@@ -255,218 +346,288 @@ export default function ChatPage() {
     createSessionMutation.mutate(values);
   };
 
+  const selectSession = (session: ChatSession) => {
+    setSelectedSession(session);
+    setLastExchange(null);
+    setSessionDrawerOpen(false);
+  };
+
   const canSubmit =
     !!selectedSession &&
     !!input.trim() &&
     (!commitEnabled || (!!commitRepositoryId && (!!commitSha.trim() || !!prNumber)));
 
   return (
-    <div className="page-grid">
+    <div className="page-grid chat-page">
       <PageHeader
         title="知识问答"
         description="结合项目知识库、短期摘要与长期记忆进行研发问答，并返回引用证据。"
         extra={
-          <Button
-            type="primary"
-            onClick={() => {
-              form.setFieldsValue({ title: `研发问答 ${new Date().toLocaleString()}` });
-              setCreateOpen(true);
-            }}
-            disabled={!projectId}
-          >
-            新建会话
-          </Button>
+          <Space wrap>
+            <Button
+              icon={<UnorderedListOutlined />}
+              onClick={() => setSessionDrawerOpen(true)}
+              disabled={!projectId}
+            >
+              会话列表
+            </Button>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => {
+                form.setFieldsValue({ title: `研发问答 ${new Date().toLocaleString()}` });
+                setCreateOpen(true);
+              }}
+              disabled={!projectId}
+            >
+              新建会话
+            </Button>
+          </Space>
         }
       />
 
       <div className="chat-layout">
-        <Card className="content-card" title="会话列表">
-          <List
-            loading={sessionsQuery.isLoading}
-            dataSource={sessionsQuery.data ?? []}
-            locale={{ emptyText: "暂无会话，请先新建会话" }}
-            renderItem={(item) => (
-              <List.Item
-                onClick={() => {
-                  setSelectedSession(item);
-                  setLastExchange(null);
-                }}
-                style={{
-                  cursor: "pointer",
-                  background: selectedSession?.id === item.id ? "#eff6ff" : "transparent",
-                  borderRadius: 10,
-                  paddingInline: 12,
-                }}
-              >
-                <div>
-                  <Typography.Text strong>{item.title}</Typography.Text>
-                  <div>
-                    <Typography.Text type="secondary">{item.status}</Typography.Text>
-                  </div>
-                </div>
-              </List.Item>
-            )}
-          />
-        </Card>
-
-        <Card className="content-card" title={selectedSession?.title ?? "会话"}>
-          {!selectedSession ? (
-            <Alert showIcon type="info" message="请先新建或选择一个会话。" />
-          ) : null}
-          {messagesQuery.isLoading ? <Skeleton active /> : null}
-          <div className="message-list">
-            {displayedMessages.map((chatMessage) => (
-              <div key={chatMessage.id} className={`message-item ${chatMessage.role}`}>
-                <Typography.Text strong>
-                  {chatMessage.role === "user" ? "你" : "AI 助手"}
-                </Typography.Text>
-                <MessageContent content={chatMessage.content} />
+        <Card className="content-card chat-thread-card" title={selectedSession?.title ?? "会话"}>
+          <div className="chat-thread-shell">
+            {!selectedSession ? (
+              <div className="chat-inline-state">
+                <Alert showIcon type="info" message="请先新建或选择一个会话。" />
               </div>
-            ))}
-          </div>
-          <Input.TextArea
-            value={input}
-            rows={5}
-            placeholder="询问实验室规范、历史 review、项目约定或测试策略"
-            style={{ marginTop: 16 }}
-            onChange={(event) => setInput(event.target.value)}
-            onPressEnter={(event) => {
-              if (!event.shiftKey) {
-                event.preventDefault();
-                submitQuestion();
-              }
-            }}
-          />
-          <Space wrap size="middle" style={{ marginTop: 12 }}>
-            <Select<ChatAction>
-              style={{ width: 170 }}
-              value={chatAction}
-              onChange={setChatAction}
-              options={[
-                { value: "auto", label: "自动识别动作" },
-                { value: "answer", label: "只回答" },
-                { value: "review", label: "代码审查" },
-                { value: "test", label: "生成测试" },
-                { value: "review_and_test", label: "审查并测试" },
-              ]}
-            />
-          </Space>
-          <div className="commit-context-panel">
-            <Checkbox
-              checked={commitEnabled}
-              onChange={(event) => setCommitEnabled(event.target.checked)}
-            >
-              精确指定 GitHub 上下文
-            </Checkbox>
-            {commitEnabled ? (
-              <Space wrap size="middle" style={{ marginTop: 12 }}>
-                <Select
-                  showSearch
-                  style={{ width: 260 }}
-                  placeholder="选择仓库"
-                  options={repoOptions}
-                  loading={reposQuery.isLoading}
-                  value={commitRepositoryId}
-                  optionFilterProp="label"
-                  onChange={setCommitRepositoryId}
-                />
-                <Input
-                  style={{ width: 220 }}
-                  placeholder="commit SHA"
-                  value={commitSha}
-                  onChange={(event) => setCommitSha(event.target.value)}
-                />
-                <InputNumber
-                  style={{ width: 130 }}
-                  min={1}
-                  precision={0}
-                  placeholder="PR 编号"
-                  value={prNumber}
-                  onChange={setPrNumber}
-                />
-                <Select<CommitIntent>
-                  style={{ width: 150 }}
-                  value={commitIntent}
-                  onChange={setCommitIntent}
-                  options={[
-                    { value: "auto", label: "自动判断" },
-                    { value: "explain", label: "功能说明" },
-                    { value: "compliance", label: "规范判断" },
-                    { value: "review", label: "代码审查" },
-                  ]}
-                />
-                <Select
-                  allowClear
-                  style={{ width: 140 }}
-                  placeholder="语言"
-                  value={language}
-                  onChange={setLanguage}
-                  options={[
-                    { value: "python", label: "Python" },
-                    { value: "java", label: "Java" },
-                  ]}
-                />
-                <Input
-                  style={{ width: 160 }}
-                  placeholder="测试框架"
-                  value={framework}
-                  onChange={(event) => setFramework(event.target.value)}
-                />
-                <Checkbox
-                  checked={persistReview}
-                  onChange={(event) => setPersistReview(event.target.checked)}
-                >
-                  保存任务结果
-                </Checkbox>
-              </Space>
             ) : null}
-          </div>
-          <Button
-            type="primary"
-            style={{ marginTop: 12 }}
-            disabled={!canSubmit}
-            loading={isStreaming}
-            onClick={submitQuestion}
-          >
-            发送问题
-          </Button>
-        </Card>
+            {messagesQuery.isLoading ? (
+              <div className="chat-inline-state">
+                <Skeleton active />
+              </div>
+            ) : null}
 
-        <Space direction="vertical" style={{ width: "100%" }} size="middle">
-          <Card className="content-card" title="引用来源">
-            <CitationList citations={lastAnswer?.citations ?? []} />
-          </Card>
-          <Card className="content-card" title="摘要与记忆">
-            <Typography.Paragraph>
-              <strong>重写查询：</strong>
-              {(lastAnswer?.rewritten_queries ?? []).join(" / ") || "暂无"}
-            </Typography.Paragraph>
-            <Typography.Paragraph>
-              <strong>长期记忆：</strong>
-              {(lastAnswer?.used_memory ?? []).join("；") || "暂无召回"}
-            </Typography.Paragraph>
-            <Typography.Paragraph>
-              <strong>推理摘要：</strong>
-              {lastAnswer?.reasoning_summary || "发送消息后显示"}
-            </Typography.Paragraph>
-            {lastAnswer?.metadata?.review_task_id ? (
-              <Typography.Paragraph>
-                <strong>审查任务：</strong>
-                {String(lastAnswer.metadata.review_task_id)}
-              </Typography.Paragraph>
-            ) : null}
-            {lastAnswer?.metadata?.test_generation_task_id ? (
-              <Typography.Paragraph>
-                <strong>测试任务：</strong>
-                {String(lastAnswer.metadata.test_generation_task_id)}
-              </Typography.Paragraph>
-            ) : null}
-            <Typography.Text type="secondary">
-              置信度：{lastAnswer ? lastAnswer.confidence.toFixed(2) : "0.00"}
-            </Typography.Text>
-          </Card>
-        </Space>
+            <div className="message-list chat-message-scroll" ref={messageScrollRef}>
+              {!messagesQuery.isLoading && selectedSession && displayedMessages.length === 0 ? (
+                <div className="chat-empty-state">还没有消息</div>
+              ) : null}
+              {displayedMessages.map((chatMessage) => {
+                const roleClass = getMessageRoleClass(chatMessage.role);
+                return (
+                  <div key={chatMessage.id} className={`message-row ${roleClass}`}>
+                    <div className="message-avatar">{getMessageInitial(chatMessage.role)}</div>
+                    <div className="message-bubble">
+                      <div className="message-author">{getMessageLabel(chatMessage.role)}</div>
+                      <MessageContent content={chatMessage.content} />
+                      {chatMessage.role === "assistant" ? (
+                        <div className="message-tools">
+                          <Tooltip title="查看这次回答的引用来源、摘要与记忆">
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<InfoCircleOutlined />}
+                              onClick={() => openAnswerContext(chatMessage)}
+                            >
+                              依据与记忆
+                            </Button>
+                          </Tooltip>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="chat-composer">
+              <div className="chat-composer-box">
+                <Input.TextArea
+                  className="chat-composer-input"
+                  value={input}
+                  autoSize={{ minRows: 2, maxRows: 7 }}
+                  placeholder="询问实验室规范、历史 review、项目约定或测试策略"
+                  onChange={(event) => setInput(event.target.value)}
+                  onPressEnter={(event) => {
+                    if (!event.shiftKey) {
+                      event.preventDefault();
+                      submitQuestion();
+                    }
+                  }}
+                />
+
+                {commitEnabled ? (
+                  <div className="commit-context-panel chat-commit-grid">
+                    <Select
+                      showSearch
+                      className="chat-repo-select"
+                      placeholder="选择仓库"
+                      options={repoOptions}
+                      loading={reposQuery.isLoading}
+                      value={commitRepositoryId}
+                      optionFilterProp="label"
+                      onChange={setCommitRepositoryId}
+                    />
+                    <Input
+                      className="chat-sha-input"
+                      placeholder="commit SHA"
+                      value={commitSha}
+                      onChange={(event) => setCommitSha(event.target.value)}
+                    />
+                    <InputNumber
+                      className="chat-pr-input"
+                      min={1}
+                      precision={0}
+                      placeholder="PR 编号"
+                      value={prNumber}
+                      onChange={setPrNumber}
+                    />
+                    <Select<CommitIntent>
+                      className="chat-intent-select"
+                      value={commitIntent}
+                      onChange={setCommitIntent}
+                      options={[
+                        { value: "auto", label: "自动判断" },
+                        { value: "explain", label: "功能说明" },
+                        { value: "compliance", label: "规范判断" },
+                        { value: "review", label: "代码审查" },
+                      ]}
+                    />
+                    <Select
+                      allowClear
+                      className="chat-language-select"
+                      placeholder="语言"
+                      value={language}
+                      onChange={setLanguage}
+                      options={[
+                        { value: "python", label: "Python" },
+                        { value: "java", label: "Java" },
+                      ]}
+                    />
+                    <Input
+                      className="chat-framework-input"
+                      placeholder="测试框架"
+                      value={framework}
+                      onChange={(event) => setFramework(event.target.value)}
+                    />
+                    <Checkbox
+                      checked={persistReview}
+                      onChange={(event) => setPersistReview(event.target.checked)}
+                    >
+                      保存任务结果
+                    </Checkbox>
+                  </div>
+                ) : null}
+
+                <div className="chat-composer-actions">
+                  <Space wrap size="middle">
+                    <Select<ChatAction>
+                      className="chat-action-select"
+                      value={chatAction}
+                      onChange={setChatAction}
+                      options={[
+                        { value: "auto", label: "自动识别动作" },
+                        { value: "answer", label: "只回答" },
+                        { value: "review", label: "代码审查" },
+                        { value: "test", label: "生成测试" },
+                        { value: "review_and_test", label: "审查并测试" },
+                      ]}
+                    />
+                    <Checkbox
+                      checked={commitEnabled}
+                      onChange={(event) => setCommitEnabled(event.target.checked)}
+                    >
+                      GitHub 上下文
+                    </Checkbox>
+                  </Space>
+                  <Tooltip title="发送问题">
+                    <Button
+                      type="primary"
+                      shape="circle"
+                      className="chat-send-button"
+                      aria-label="发送问题"
+                      icon={<SendOutlined />}
+                      disabled={!canSubmit}
+                      loading={isStreaming}
+                      onClick={submitQuestion}
+                    />
+                  </Tooltip>
+                </div>
+              </div>
+            </div>
+          </div>
+        </Card>
       </div>
+
+      <Drawer
+        title="会话列表"
+        placement="left"
+        open={sessionDrawerOpen}
+        width="min(340px, 100vw)"
+        getContainer={false}
+        rootStyle={{ position: "absolute" }}
+        className="chat-session-drawer"
+        onClose={() => setSessionDrawerOpen(false)}
+      >
+        <List
+          className="chat-session-list"
+          loading={sessionsQuery.isLoading}
+          dataSource={sessionsQuery.data ?? []}
+          locale={{ emptyText: "暂无会话，请先新建会话" }}
+          renderItem={(item) => (
+            <List.Item
+              className={`chat-session-item ${selectedSession?.id === item.id ? "active" : ""}`}
+              onClick={() => selectSession(item)}
+            >
+              <Typography.Text strong className="chat-session-title">
+                {item.title}
+              </Typography.Text>
+              <Typography.Text type="secondary" className="chat-session-status">
+                {item.status}
+              </Typography.Text>
+            </List.Item>
+          )}
+        />
+      </Drawer>
+
+      <Drawer
+        title="回答相关信息"
+        open={!!answerContext}
+        width="min(420px, 100vw)"
+        onClose={() => setAnswerContext(null)}
+      >
+        {answerContext ? (
+          <div className="answer-context-content">
+            <section>
+              <Typography.Title level={5}>引用来源</Typography.Title>
+              <CitationList citations={answerContext.citations} />
+            </section>
+            <section className="answer-context-section">
+              <Typography.Title level={5}>摘要与记忆</Typography.Title>
+              <Typography.Paragraph>
+                <strong>重写查询：</strong>
+                {answerContext.rewrittenQueries.join(" / ") || "暂无"}
+              </Typography.Paragraph>
+              <Typography.Paragraph>
+                <strong>长期记忆：</strong>
+                {answerContext.usedMemory.join("；") || "暂无召回"}
+              </Typography.Paragraph>
+              <Typography.Paragraph>
+                <strong>推理摘要：</strong>
+                {answerContext.reasoningSummary || "暂无"}
+              </Typography.Paragraph>
+              {answerContext.metadata.review_task_id ? (
+                <Typography.Paragraph>
+                  <strong>审查任务：</strong>
+                  {String(answerContext.metadata.review_task_id)}
+                </Typography.Paragraph>
+              ) : null}
+              {answerContext.metadata.test_generation_task_id ? (
+                <Typography.Paragraph>
+                  <strong>测试任务：</strong>
+                  {String(answerContext.metadata.test_generation_task_id)}
+                </Typography.Paragraph>
+              ) : null}
+              <Typography.Text type="secondary">
+                置信度：
+                {answerContext.confidence === null ? "暂无" : answerContext.confidence.toFixed(2)}
+              </Typography.Text>
+            </section>
+          </div>
+        ) : null}
+      </Drawer>
 
       <Modal
         title="新建问答会话"

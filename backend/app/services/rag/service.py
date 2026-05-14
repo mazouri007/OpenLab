@@ -25,6 +25,7 @@ from app.services.rag.document_parser import (
 from app.services.llm.exceptions import LLMConfigurationError, LLMInvocationError
 from app.services.llm.langchain_provider import LangChainLLMProvider
 from app.services.llm.provider_resolver import resolve_model_config
+from app.services.rag.bm25 import bm25_scores
 from app.services.rag.vector_store import RagVectorStore
 
 
@@ -116,7 +117,7 @@ class RagService:
             try:
                 self.vector_store.delete_document(document.id)
             except Exception as exc:  # noqa: BLE001
-                document.error_message = f"ChromaDB 旧向量清理失败，继续重建关键词索引：{exc}"
+                document.error_message = f"ChromaDB 旧向量清理失败，继续重建 BM25 索引：{exc}"
         self.db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id == document.id).delete()
         model_config = None
         try:
@@ -192,9 +193,9 @@ class RagService:
                 )
                 vector_indexed = True
             except Exception as exc:  # noqa: BLE001
-                document.error_message = f"ChromaDB 向量索引失败，已保留关键词索引：{exc}"
+                document.error_message = f"ChromaDB 向量索引失败，已保留 BM25 索引：{exc}"
         elif embeddings:
-            document.error_message = "ChromaDB 向量库不可用，已保留关键词索引。"
+            document.error_message = "ChromaDB 向量库不可用，已保留 BM25 索引。"
 
         document.metadata_json = {
             **(document.metadata_json if isinstance(document.metadata_json, dict) else {}),
@@ -343,15 +344,13 @@ class RagService:
         chunks = self.db.query(KnowledgeChunk).filter(KnowledgeChunk.project_id == project_id).all()
         if not chunks:
             return []
-        keyword_scores: dict[str, float] = {}
-        for chunk in chunks:
-            text = str(chunk.metadata_json.get("indexed_content") or chunk.content).lower()
-            score = 0.0
-            for query in queries:
-                for token in query.lower().split():
-                    if token and token in text:
-                        score += 1.0
-            keyword_scores[chunk.id] = score
+        keyword_scores = bm25_scores(
+            [
+                (chunk.id, str(chunk.metadata_json.get("indexed_content") or chunk.content))
+                for chunk in chunks
+            ],
+            queries,
+        )
 
         vector_scores: dict[str, float] = {}
         try:

@@ -15,6 +15,7 @@ from app.main import app
 from app.models import KnowledgeChunk
 from app.schemas.kb import KnowledgeDocumentCreate
 from app.services.rag.chunking import chunk_elements
+from app.services.rag.bm25 import bm25_scores
 from app.services.rag.document_parser import (
     EmptyDocumentError,
     UnsupportedDocumentTypeError,
@@ -32,6 +33,27 @@ def test_text_chunker_respects_long_text_limit() -> None:
     assert len(chunks) > 1
     assert all(len(chunk.content) <= 1400 for chunk in chunks)
     assert chunks[0].metadata["section_path"] == ["规范"]
+
+
+def test_bm25_scores_rank_relevant_chinese_chunk() -> None:
+    scores = bm25_scores(
+        [
+            ("api", "治疗方式管理接口支持新增治疗方式、删除治疗方式和年龄段绑定。"),
+            ("label", "CVAT 数据标注流程包括创建项目、上传视频和导出标注。"),
+            ("generic", "系统支持用户登录和基础页面展示。"),
+        ],
+        ["新增治疗方式接口"],
+    )
+
+    assert scores["api"] == 1.0
+    assert scores["api"] > scores["generic"]
+    assert scores["api"] > scores["label"]
+
+
+def test_bm25_scores_return_zero_for_no_keyword_match() -> None:
+    scores = bm25_scores([("doc-1", "alpha beta"), ("doc-2", "gamma delta")], ["完全无关"])
+
+    assert scores == {"doc-1": 0.0, "doc-2": 0.0}
 
 
 def test_text_chunker_keeps_small_heading_with_body() -> None:
@@ -201,4 +223,4 @@ def test_index_document_keeps_keyword_chunks_when_vector_store_unavailable() -> 
     assert chunks
     assert refreshed_document.parse_status == "indexed"
     assert refreshed_document.metadata_json["vector_indexed"] is False
-    assert "关键词索引" in refreshed_document.error_message
+    assert "BM25 索引" in refreshed_document.error_message

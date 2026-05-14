@@ -16,7 +16,7 @@
 
 - 后端：FastAPI、SQLAlchemy 2.x、Alembic、Pydantic、Celery
 - AI 编排：LangChain、LangGraph、langchain-openai
-- 检索：SQLite chunk 表 + 本地持久化 ChromaDB 向量索引
+- 检索：SQLite chunk 表 + BM25 关键词召回 + 本地持久化 ChromaDB 向量索引
 - 前端：React、TypeScript、Vite、Ant Design、TanStack Query
 - 集成：GitHub REST / Webhook skeleton
 
